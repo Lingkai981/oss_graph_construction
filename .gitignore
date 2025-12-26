@@ -29,6 +29,16 @@ Thumbs.db
 logs/
 *.log
 
+# Output files
+output/
+*.graphml
+*.json
+
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+
 # Environment variables
 .env
 .env.local
