@@ -99,6 +99,9 @@ python run.py --start-date 2024-01-01 --end-date 2024-12-31
 
 # 指定导出格式（graphml或json）
 python run.py --format json
+
+# 移除孤立节点（没有边的节点），使图更清晰便于分析
+python run.py --remove-isolated
 ```
 
 ### 输出结果

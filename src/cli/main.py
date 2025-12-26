@@ -71,6 +71,12 @@ def parse_arguments():
         help='导出格式（默认: graphml）'
     )
     
+    parser.add_argument(
+        '--remove-isolated',
+        action='store_true',
+        help='移除孤立节点（没有边的节点），使图更清晰便于分析'
+    )
+    
     return parser.parse_args()
 
 
@@ -152,7 +158,9 @@ def main():
         
         # 步骤4: 构建图快照
         logger.info("步骤4: 构建图快照...")
-        snapshots = build_all_snapshots(all_data)
+        if args.remove_isolated:
+            logger.info("启用移除孤立节点功能")
+        snapshots = build_all_snapshots(all_data, remove_isolated=args.remove_isolated)
         logger.info(f"图快照构建完成: {len(snapshots)} 个快照")
         
         # 步骤5: 导出快照

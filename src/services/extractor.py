@@ -176,6 +176,11 @@ def extract_data_for_date(conn, date: str) -> Dict[str, Any]:
             if commit.get('author_id'):
                 contributor_ids.add(commit['author_id'])
         
+        # 从边中提取contributor_id（边中也可能有新的贡献者）
+        for edge in data['edges']:
+            if edge.get('contributor_id'):
+                contributor_ids.add(edge['contributor_id'])
+        
         # 提取相关的项目（从边中获取project_id）
         project_ids = set()
         for edge in data['edges']:
@@ -183,17 +188,23 @@ def extract_data_for_date(conn, date: str) -> Dict[str, Any]:
                 project_ids.add(edge['project_id'])
         
         # 如果日期是第一天，提取所有项目和贡献者
-        # 否则只提取新增的（这里简化处理，实际应该跟踪哪些是新增的）
+        # 否则只提取相关的贡献者（从提交和边中获取的ID）
         all_dates = extract_all_dates(conn)
         if all_dates and date == all_dates[0]:
+            # 第一天：提取所有项目和贡献者
             all_projects = extract_projects(conn)
             all_contributors = extract_contributors(conn)
             data['projects'] = all_projects
             data['contributors'] = all_contributors
         else:
-            # 只提取相关的项目和贡献者
-            # 这里简化处理，实际应该从数据库查询特定的ID
-            pass
+            # 非第一天：只提取相关的贡献者（从提交和边中获取的ID）
+            if contributor_ids:
+                related_contributors = extract_contributors(conn, list(contributor_ids))
+                data['contributors'] = related_contributors
+                logger.debug(f"提取到 {len(related_contributors)} 个相关贡献者")
+            
+            # 项目节点通常在第一天已经提取，后续日期不需要重复提取
+            # 但如果边中有新的project_id，可以考虑提取（当前简化处理，不提取）
         
         log_msg = f"日期 {date} 提取完成: {len(data['commits'])} 个提交, {len(data['edges'])} 条关系"
         if skipped_commits > 0 or skipped_edges > 0:

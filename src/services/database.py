@@ -99,7 +99,12 @@ def extract_projects(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             except (KeyError, IndexError):
                 project['created_at'] = None
             try:
-                project['updated_at'] = row['updated_at']
+                updated_at_value = row['updated_at']
+                # 检查值是否有效（不是 None、空字符串、0）
+                if updated_at_value and str(updated_at_value).strip() and str(updated_at_value) != '0':
+                    project['updated_at'] = updated_at_value
+                else:
+                    project['updated_at'] = None
             except (KeyError, IndexError):
                 project['updated_at'] = None
             projects.append(project)
@@ -111,12 +116,13 @@ def extract_projects(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         return projects
 
 
-def extract_contributors(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def extract_contributors(conn: sqlite3.Connection, contributor_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     从users表提取贡献者数据
     
     Args:
         conn: SQLite连接对象
+        contributor_ids: 可选的贡献者ID列表，如果提供则只提取这些ID的贡献者
     
     Returns:
         贡献者数据列表
@@ -124,11 +130,21 @@ def extract_contributors(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     contributors = []
     try:
         cursor = conn.cursor()
-        # 尝试查询users表
-        cursor.execute("""
-            SELECT id, login, name, created_at 
-            FROM users
-        """)
+        # 如果提供了ID列表，只提取这些ID的贡献者
+        if contributor_ids:
+            placeholders = ','.join(['?'] * len(contributor_ids))
+            query = f"""
+                SELECT id, login, name, created_at 
+                FROM users
+                WHERE id IN ({placeholders})
+            """
+            cursor.execute(query, contributor_ids)
+        else:
+            # 提取所有贡献者
+            cursor.execute("""
+                SELECT id, login, name, created_at 
+                FROM users
+            """)
         
         for row in cursor.fetchall():
             contributor = {'id': row['id']}
@@ -146,7 +162,7 @@ def extract_contributors(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 contributor['created_at'] = None
             contributors.append(contributor)
         
-        logger.info(f"提取到 {len(contributors)} 个贡献者")
+        logger.debug(f"提取到 {len(contributors)} 个贡献者")
         return contributors
     except sqlite3.Error as e:
         logger.warning(f"提取贡献者数据失败: {str(e)}，可能表不存在或结构不同")

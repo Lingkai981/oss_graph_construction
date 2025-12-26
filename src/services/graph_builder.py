@@ -16,6 +16,23 @@ from src.utils.date_utils import parse_timestamp
 logger = get_logger()
 
 
+def remove_isolated_nodes(graph: nx.DiGraph) -> nx.DiGraph:
+    """
+    移除孤立节点（没有边的节点）
+    
+    Args:
+        graph: NetworkX有向图对象
+    
+    Returns:
+        移除孤立节点后的图对象
+    """
+    isolated = list(nx.isolates(graph))
+    if isolated:
+        graph.remove_nodes_from(isolated)
+        logger.info(f"移除了 {len(isolated)} 个孤立节点")
+    return graph
+
+
 def add_nodes(graph: nx.DiGraph, nodes: List[Dict[str, Any]], node_type: str) -> None:
     """
     将节点添加到图中，包含所有节点属性
@@ -31,11 +48,20 @@ def add_nodes(graph: nx.DiGraph, nodes: List[Dict[str, Any]], node_type: str) ->
                 if 'id' not in node_data:
                     logger.warning(f"项目数据缺少id字段: {node_data}，跳过")
                     continue
+                # 处理updated_at，过滤无效值
+                updated_at_value = node_data.get('updated_at')
+                updated_at = None
+                if updated_at_value and str(updated_at_value).strip() and str(updated_at_value) != '0':
+                    parsed = parse_timestamp(str(updated_at_value))
+                    # 只有解析成功且不是1970-01-01才使用
+                    if parsed and parsed.year > 1970:
+                        updated_at = parsed
+                
                 node = create_project_node(
                     project_id=node_data['id'],
                     name=node_data.get('name'),
                     created_at=parse_timestamp(str(node_data.get('created_at'))) if node_data.get('created_at') else None,
-                    updated_at=parse_timestamp(str(node_data.get('updated_at'))) if node_data.get('updated_at') else None
+                    updated_at=updated_at
                 )
             elif node_type == 'contributor':
                 if 'id' not in node_data:
@@ -61,6 +87,21 @@ def add_nodes(graph: nx.DiGraph, nodes: List[Dict[str, Any]], node_type: str) ->
             else:
                 logger.warning(f"未知的节点类型: {node_type}，跳过")
                 continue
+            
+            # 为节点添加统一的label属性，便于可视化
+            # 优先使用name，其次使用login，最后使用node_id
+            label = None
+            if node_type == 'project':
+                label = node.attributes.get('name') or node.node_id
+            elif node_type == 'contributor':
+                label = node.attributes.get('name') or node.attributes.get('login') or node.node_id
+            elif node_type == 'commit':
+                # 提交节点使用message的前50个字符或sha
+                label = (node.attributes.get('message', '')[:50] if node.attributes.get('message') 
+                        else node.attributes.get('sha') or node.node_id)
+            
+            # 添加label属性
+            node.attributes['label'] = label
             
             # 添加节点到图（如果节点已存在，更新属性）
             graph.add_node(node.node_id, **node.attributes)
@@ -134,6 +175,17 @@ def build_snapshot(data: Dict[str, Any], previous_snapshot: Optional[nx.DiGraph]
     if previous_snapshot:
         # 复制所有节点
         for node_id, node_attrs in previous_snapshot.nodes(data=True):
+            # 确保累积的节点也有label属性（如果没有的话）
+            if 'label' not in node_attrs:
+                # 根据节点ID推断label
+                if node_id.startswith('project_'):
+                    node_attrs['label'] = node_attrs.get('name') or node_id
+                elif node_id.startswith('contributor_'):
+                    node_attrs['label'] = node_attrs.get('name') or node_attrs.get('login') or node_id
+                elif node_id.startswith('commit_'):
+                    node_attrs['label'] = node_attrs.get('message', '')[:50] if node_attrs.get('message') else node_attrs.get('sha') or node_id
+                else:
+                    node_attrs['label'] = node_id
             graph.add_node(node_id, **node_attrs)
         
         # 复制所有边（边也累积）
@@ -162,12 +214,13 @@ def build_snapshot(data: Dict[str, Any], previous_snapshot: Optional[nx.DiGraph]
     return graph
 
 
-def build_all_snapshots(all_data: List[Dict[str, Any]]) -> List[nx.DiGraph]:
+def build_all_snapshots(all_data: List[Dict[str, Any]], remove_isolated: bool = False) -> List[nx.DiGraph]:
     """
     为所有日期构建图快照
     
     Args:
         all_data: 所有日期的数据列表，按时间顺序排序
+        remove_isolated: 是否移除孤立节点（没有边的节点）
     
     Returns:
         图快照列表，按时间顺序排序
@@ -185,13 +238,34 @@ def build_all_snapshots(all_data: List[Dict[str, Any]]) -> List[nx.DiGraph]:
             # 如果有前一个快照，复制所有节点和边（累积机制）
             if previous_snapshot:
                 for node_id, node_attrs in previous_snapshot.nodes(data=True):
+                    # 确保累积的节点也有label属性（如果没有的话）
+                    if 'label' not in node_attrs:
+                        # 根据节点ID推断label
+                        if node_id.startswith('project_'):
+                            node_attrs['label'] = node_attrs.get('name') or node_id
+                        elif node_id.startswith('contributor_'):
+                            node_attrs['label'] = node_attrs.get('name') or node_attrs.get('login') or node_id
+                        elif node_id.startswith('commit_'):
+                            node_attrs['label'] = node_attrs.get('message', '')[:50] if node_attrs.get('message') else node_attrs.get('sha') or node_id
+                        else:
+                            node_attrs['label'] = node_id
                     graph.add_node(node_id, **node_attrs)
                 for source, target, edge_attrs in previous_snapshot.edges(data=True):
                     graph.add_edge(source, target, **edge_attrs)
+            
+            # 如果启用移除孤立节点，则移除
+            if remove_isolated:
+                remove_isolated_nodes(graph)
+            
             snapshots.append(graph)
             logger.info(f"日期 {date} 无数据，创建空图（{len(graph.nodes())} 个节点, {len(graph.edges())} 条边）")
         else:
             snapshot = build_snapshot(data, previous_snapshot)
+            
+            # 如果启用移除孤立节点，则移除
+            if remove_isolated:
+                remove_isolated_nodes(snapshot)
+            
             snapshots.append(snapshot)
             previous_snapshot = snapshot
     
