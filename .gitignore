@@ -43,3 +43,6 @@ build/
 .env
 .env.local
 
+# ppt文件
+*.pptx
+
