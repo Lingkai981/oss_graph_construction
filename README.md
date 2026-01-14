@@ -1,14 +1,17 @@
-# 时间快照式时序图建模
+# 时间快照式与时序语义图建模
 
-一个从GHTorrent SQLite数据库中提取时间序列数据，使用NetworkX按天粒度构建图快照，并导出为标准格式（GraphML/JSON）的工具。
+一个用于开源项目结构与行为分析的图建模工具集，当前包含两类能力：
+
+- **001 特性：时间快照式时序图建模** —— 从 GHTorrent SQLite 数据库中提取时间序列数据，按天粒度构建图快照；
+- **002 特性：基于 GitHub 事件的一小时时序语义图建模** —— 从 GitHub 事件 JSON 行文件中构建带时间顺序与语义属性的一小时时序图。
 
 ## 功能特性
 
-- 从GHTorrent SQLite数据库提取时间序列数据
-- 按天粒度构建图快照
-- 支持GraphML和JSON格式导出
-- 自动处理数据异常（记录并跳过策略）
-- 所有输出使用中文
+- 从 GHTorrent SQLite 数据库提取时间序列数据，按天粒度构建图快照（snapshot 模式）；
+- 从 GitHub 事件 JSON 行文件构建一小时窗口的时序语义图（temporal-semantic-graph 模式）；
+- 支持 GraphML 和 JSON 格式导出；
+- 自动处理数据异常（记录并跳过策略）；
+- 所有输出使用中文。
 
 ## 项目结构
 
@@ -16,7 +19,7 @@
 oss_graph_construction/
 ├── src/                    # 源代码
 │   ├── models/            # 数据模型（节点、边）
-│   ├── services/          # 业务逻辑（数据库、提取、图构建、导出）
+│   ├── services/          # 业务逻辑（数据库、提取、图构建、导出、时序语义图）
 │   ├── cli/               # 命令行接口
 │   └── utils/             # 工具函数（日志、日期处理）
 ├── tests/                 # 测试代码
@@ -24,7 +27,8 @@ oss_graph_construction/
 │   ├── integration/       # 集成测试
 │   └── contract/          # 契约测试
 ├── data/                  # 数据目录
-│   └── rxjs-ghtorrent.db  # GHTorrent数据库文件
+│   ├── rxjs-ghtorrent.db          # GHTorrent 数据库文件
+│   └── 2015-01-01-15.json         # GitHub 事件 JSON 行文件（一小时窗口示例）
 ├── output/                # 输出目录（自动创建）
 └── logs/                  # 日志目录（自动创建）
 ```
@@ -66,7 +70,7 @@ python -c "import networkx as nx; print(f'NetworkX版本: {nx.__version__}')"
 
 ## 使用方法
 
-### 基本用法
+### 基本用法（001：快照式时序图建模）
 
 运行主程序从数据库提取数据并构建图快照：
 
@@ -82,7 +86,7 @@ $env:PYTHONPATH="."; python src/cli/main.py
 PYTHONPATH=. python src/cli/main.py
 ```
 
-### 命令行选项
+### 命令行选项（快照模式）
 
 ```bash
 # 指定数据库路径（默认：data/rxjs-ghtorrent.db）
@@ -117,6 +121,37 @@ output/
 ```
 
 每个文件对应一个日期的图快照，可以使用Gephi、Cytoscape等工具打开。
+
+### 一小时时序语义图模式（002：temporal-semantic-graph）
+
+基于 GitHub 事件 JSON 行文件构建一小时时序语义图：
+
+```bash
+python -m src.cli.main temporal-semantic-graph \
+  --input data/2015-01-01-15.json \
+  --output-dir output/temporal-semantic-graph \
+  --export-format json,graphml
+```
+
+参数说明：
+
+- `--input`：GitHub 事件 JSON 行文件路径；
+- `--output-dir`：时序语义图导出目录，默认 `output/temporal-semantic-graph/`；
+- `--export-format`：导出格式列表（`json`、`graphml` 或两者）。
+
+导出结果示例：
+
+```text
+output/temporal-semantic-graph/
+├── temporal-graph-2015-01-01-15.json
+└── temporal-graph-2015-01-01-15.graphml
+```
+
+JSON 文件遵循 `specs/002-temporal-semantic-graph/contracts/README.md` 中的结构约定：
+
+- `meta`：包含源文件路径、生成时间、节点数、边数等元信息；
+- `nodes`：节点列表（事件 / 开发者 / 仓库 / 提交），携带语义属性；
+- `edges`：边列表（开发者→事件、事件→仓库、事件→提交），携带关系类型与时间属性。
 
 ## 工作流程
 
