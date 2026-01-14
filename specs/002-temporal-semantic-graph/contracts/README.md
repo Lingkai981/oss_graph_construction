@@ -91,6 +91,7 @@ python -m src.cli.main temporal-semantic-graph \
         "event_id": "2489651051",
         "event_type": "PushEvent",
         "created_at": "2015-01-01T15:00:01Z",
+        "importance_score": 0.82,
         "...": "..."
       }
     }
@@ -102,7 +103,8 @@ python -m src.cli.main temporal-semantic-graph \
       "source": "actor:665991",
       "target": "event:2489651051",
       "attributes": {
-        "created_at": "2015-01-01T15:00:01Z"
+        "created_at": "2015-01-01T15:00:01Z",
+        "contribution_strength": 0.73
       }
     }
   ]
@@ -115,12 +117,14 @@ python -m src.cli.main temporal-semantic-graph \
 - 每个节点有：
   - `id`：在全图内唯一，可组合前缀（如 `event:`、`actor:` 等）；
   - `type`：节点类型（`Event` / `Actor` / `Repository` / `Commit`）；
-  - `attributes`：包含来自原始数据或派生的语义属性。
+  - `attributes`：包含来自原始数据或派生的语义属性，例如：
+    - Event 节点的 `event_id`、`event_type`、`created_at`、`importance_score`（0～1）； 
+    - Actor 节点的 `actor_id`、`login`、`influence_score`（0～1）等。
 - 每条边有：
   - `id`：在全图内唯一，可由 `source` 与 `target` 拼接；
   - `type`：边类型，如 `"ACTOR_TRIGGERED_EVENT"` 等；
   - `source` / `target`：引用节点的 `id`；
-  - `attributes`：包含边级别的属性，如时间戳等。
+  - `attributes`：包含边级别的属性，如时间戳以及 `contribution_strength`（0～1，用于衡量该次行为的综合贡献强度）等。
 
 ---
 

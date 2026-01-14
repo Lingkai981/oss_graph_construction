@@ -83,10 +83,15 @@ def run_temporal_graph_pipeline(
 
         payload = ev.get("payload") or {}
         commits = payload.get("commits") or []
-        commit_factor = math.log1p(len(commits)) if commits else 1.0
+        # 对 PushEvent 使用提交数的对数放大，其余事件暂时不使用 commits 因子
+        if event_type == "PushEvent" and commits:
+            commit_factor = math.log1p(len(commits))
+        else:
+            commit_factor = 1.0
 
         raw_imp = base * commit_factor
-        event_importance_raw[event_id] = event_importance_raw.get(event_id, 0.0) + raw_imp
+        # 事件 ID 在 GitHub 归档中应是全局唯一，因此直接赋值即可
+        event_importance_raw[event_id] = raw_imp
 
         actor = ev.get("actor") or {}
         actor_id = actor.get("id")
@@ -97,20 +102,34 @@ def run_temporal_graph_pipeline(
             if repo_id is not None:
                 actor_repo_set[actor_id].add(repo_id)
 
-    # 为跨仓库活动增加一点加成
+    # 为跨仓库活动增加一点加成（对数缩放，避免线性放大过强）
+    cross_repo_alpha = 0.5
     for actor_id, repos in actor_repo_set.items():
-        actor_influence_raw[actor_id] += 0.5 * len(repos)
+        repo_count = len(repos)
+        if repo_count > 0:
+            actor_influence_raw[actor_id] += cross_repo_alpha * math.log1p(repo_count)
 
-    def _normalize(scores: Dict) -> Dict:
+    def _min_max_normalize(scores: Dict) -> Dict:
+        """
+        对原始得分做 min-max 归一化，映射到 [0, 1] 区间。
+
+        - 若所有值相同且 > 0，则统一设为 1.0，以保留“有贡献”的语义；
+        - 若所有值 <= 0，则统一设为 0.0。
+        """
         if not scores:
             return {}
-        max_v = max(scores.values())
+        values = list(scores.values())
+        min_v = min(values)
+        max_v = max(values)
         if max_v <= 0:
             return {k: 0.0 for k in scores}
-        return {k: float(v) / float(max_v) for k, v in scores.items()}
+        if max_v == min_v:
+            return {k: 1.0 for k in scores}
+        scale = max_v - min_v
+        return {k: float(v - min_v) / float(scale) for k, v in scores.items()}
 
-    event_importance = _normalize(event_importance_raw)
-    actor_influence = _normalize(actor_influence_raw)
+    event_importance = _min_max_normalize(event_importance_raw)
+    actor_influence = _min_max_normalize(actor_influence_raw)
 
     # 3. 按分钟分组并为每个分钟构建独立图
     # 键格式示例：2015-01-01-15-00

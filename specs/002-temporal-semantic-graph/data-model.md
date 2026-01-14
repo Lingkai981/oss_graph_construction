@@ -13,14 +13,17 @@
 - **唯一标识**：
   - `event_id`：来自原始字段 `id`，全局唯一。
 - **关键属性字段**（全部来自真实数据或简单派生）：
-  - `type`：事件类型（如 `PushEvent`, `CreateEvent`, `WatchEvent` 等）。
-  - `created_at`：事件发生时间（原始 ISO8601 字符串，如 `2015-01-01T15:00:01Z`）。
-  - `created_at_ts`：将 `created_at` 解析为时间戳的数值形式（派生属性，便于排序与比较）。
-  - `public`：布尔值，来自原始字段 `public`。
-  - `repo_id`：目标仓库 ID（来自 `repo.id`，用于快速索引）。
-  - `actor_id`：触发事件的开发者 ID（来自 `actor.id`）。
-  - `raw_type`：与 `type` 相同，可选保留原始字符串以便调试（如不需要可省略）。
-  - （可选）`payload_summary`：从 `payload` 中抽取的关键信息摘要（例如 PushEvent 中的第一条 commit message 的截断文本）。
+  - 基础属性：
+    - `type`：事件类型（如 `PushEvent`, `CreateEvent`, `WatchEvent` 等）。
+    - `created_at`：事件发生时间（原始 ISO8601 字符串，如 `2015-01-01T15:00:01Z`）。
+    - `created_at_ts`：将 `created_at` 解析为时间戳的数值形式（派生属性，便于排序与比较）。
+    - `public`：布尔值，来自原始字段 `public`。
+    - `repo_id`：目标仓库 ID（来自 `repo.id`，用于快速索引）。
+    - `actor_id`：触发事件的开发者 ID（来自 `actor.id`）。
+    - `raw_type`：与 `type` 相同，可选保留原始字符串以便调试（如不需要可省略）。
+    - （可选）`payload_summary`：从 `payload` 中抽取的关键信息摘要（例如 PushEvent 中的第一条 commit message 的截断文本）。
+  - 语义属性（基于整小时事件与图结构计算）：
+    - `importance_score`：事件在该一小时内的重要性评分（0～1），由事件类型权重和提交数量等因素计算并经 min-max 归一化得到，数值越高表示该事件在当前时间窗口中越“关键”。
 - **校验规则 / 约束**：
   - 每个事件节点必须有 `event_id`、`type`、`created_at` 三个字段。
   - 如 `actor` 或 `repo` 缺失，则对应 `actor_id`/`repo_id` 可以为空，但事件节点本身仍可存在。

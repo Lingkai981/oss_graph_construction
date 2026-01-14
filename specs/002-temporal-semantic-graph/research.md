@@ -102,13 +102,46 @@
 
 ---
 
+## 决策 8：语义评分（importance / influence / contribution）的计算方式
+
+- **结论**：
+  - 事件重要性 `importance_score`：基于事件类型权重和提交数量计算原始得分，再使用 **min-max 归一化** 映射到 \[0,1]；
+  - 开发者影响力 `influence_score`：累加其参与事件的重要性得分，并对跨仓库活动数量进行对数放大加成，同样通过 min-max 归一化映射到 \[0,1]；
+  - 贡献强度 `contribution_strength`：定义为“开发者影响力 × 事件重要性”的乘积，直接落在 \[0,1] 区间。
+- **计算规则概述**：
+  - 事件原始重要度：
+    - 为不同事件类型设置基础权重（例如：`PushEvent` 3.0、`CreateEvent` 2.0、`PullRequestEvent` 2.0、`IssuesEvent`/`IssueCommentEvent` 1.5、`WatchEvent` 1.0，其余类型默认 1.0）；
+    - 对于 `PushEvent`，根据 `payload.commits` 的长度使用对数放大因子 `log1p(len(commits))`，得到 `raw_imp = base_weight * log1p(commit_count)`；
+    - 对于 `PullRequestEvent` 等没有 `commits` 列表但有 `pull_request.commits` 计数的信息，可在后续迭代中扩展使用类似规则。
+  - 开发者原始影响力：
+    - 对每个事件，将该事件的 `raw_imp` 加到触发该事件的 `actor.id` 上；
+    - 统计每个开发者涉及的不同 `repo.id` 数量 `repo_count`，并追加跨仓库加成 `cross_bonus = α * log1p(repo_count)`（当前实现中 `α` 为一个常量系数，例如 0.5）；
+    - 得到 `actor_influence_raw = sum(raw_imp) + cross_bonus`。
+  - 归一化：
+    - 对事件和开发者分别使用 min-max 归一化：
+      - 若所有值相同，则统一设为 1.0（避免全 0 失去区分度）；
+      - 否则 `score_norm = (v - min) / (max - min)`，稳定映射到 \[0,1] 同时保留相对差异。
+  - 边级贡献强度：
+    - 对于一条开发者→事件边，`contribution_strength = influence_score(actor) * importance_score(event)`。
+- **理由**：
+  - 使用类型权重 + 对数因子，可以增强对“高贡献事件”（例如包含提交的 Push）的敏感度，又不会让提交数量线性放大导致极端值；
+  - min-max 归一化比单纯的“除以最大值”更稳定，可以在存在明显长尾时仍保留中间区域的区分度；
+  - 开发者跨仓库活动数量是影响力的重要信号，但通过 `log1p` 限制其增长，可以避免少量“扫星式 watch”行为在数值上压倒真正持续贡献的开发者；
+  - 定义 `contribution_strength = influence × importance` 使得“强开发者做的重要事件”在数值上自然突出，便于下游分析按该指标排序或过滤。
+- **备选方案与后续优化方向**：
+  - 可以在未来通过配置文件将类型权重、加成系数 `α`、是否采用 min-max 或其他归一化方式（如分位数归一化、Z-score）开放出来；
+  - 可在更大时间窗口上引入图算法（如 PageRank、中心性指标）进一步丰富语义评分，但当前特性限定在单小时范围内，优先采用简单、可解释且完全基于本文件数据的方案。
+
+---
+
 ## 小结
 
 通过上述决策，本特性在以下方面已经达成清晰共识：  
 （1）基于现有 Python/`networkx` 技术栈实现一小时 GitHub 事件的时序语义图构建；  
 （2）在源码与输出目录上通过子目录区分，与 001 特性形成清晰边界；  
 （3）在图建模粒度上引入事件、开发者、仓库、提交四类节点和关键关系；  
-（4）在首版中保留所有事件与仓库，以便进行更广泛的行为分析。  
+（4）在首版中保留所有事件与仓库，以便进行更广泛的行为分析；  
+（5）在语义层面，通过可解释的、归一化的评分机制刻画事件重要性与开发者影响力，并在边上编码贡献强度，支持后续分析与推理。  
 后续在 `data-model.md` 与 `contracts/` 中将根据这些决策进一步细化实体字段和 CLI 使用方式。
 
 

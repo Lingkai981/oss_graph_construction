@@ -80,6 +80,15 @@ p = pathlib.Path("output/temporal-semantic-graph/temporal-graph-2015-01-01-15.js
 data = json.loads(p.read_text(encoding="utf-8"))
 print("节点数:", len(data.get("nodes", [])))
 print("边数:", len(data.get("edges", [])))
+
+# 额外示例：查看一个事件节点和一个开发者节点的语义评分
+node_map = {n["id"]: n for n in data.get("nodes", [])}
+event = node_map.get("event:1")
+actor = node_map.get("actor:1")
+if event:
+    print("事件1的重要性评分 importance_score:", event["attributes"].get("importance_score"))
+if actor:
+    print("开发者1的影响力评分 influence_score:", actor["attributes"].get("influence_score"))
 PY
 ```
 
