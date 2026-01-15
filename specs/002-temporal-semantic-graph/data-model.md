@@ -59,8 +59,8 @@
   - 基础属性：
     - `name`：来自 `repo.name`，通常形如 `owner/repo`。
     - `url`：来自 `repo.url`。
-  - （可选）语义属性（后续可扩展）：
-    - 如 `minute_state`（该分钟内仓库的活跃状态标签）、`dominant_event_type`（该分钟内主导事件类型）等，本次实现先聚焦在开发者与事件层面的语义评分。
+  - 语义属性（基于整小时事件与图结构计算）：
+    - `activity_score`：仓库在该一小时内（或该分钟快照中）的活跃度评分（0～1），基于指向该仓库的所有事件的重要性得分总和，并考虑参与该仓库的不同开发者数量（对数加成）。数值越高，表示该仓库在当前时间窗口内越“活跃”或“受关注”。
 - **校验规则 / 约束**：
   - 缺失 `repo` 字段的事件不创建仓库节点。
   - 同一 `repo_id` 的仓库节点在图中只有一个。
@@ -73,12 +73,15 @@
 - **唯一标识**：
   - `commit_sha`：来自 `commits[*].sha`。
 - **关键属性字段**：
-  - `message`：来自 `commits[*].message`。
-  - `author_name`：来自 `commits[*].author.name`。
-  - `author_email`：来自 `commits[*].author.email`。
-  - `distinct`：来自 `commits[*].distinct`（布尔值，标识该提交是否在此次 push 中为“新”）。
-  - `url`：来自 `commits[*].url`。
-  - （可选派生）`message_length`：提交信息长度，用于简单语义分析。
+  - 基础属性：
+    - `message`：来自 `commits[*].message`。
+    - `author_name`：来自 `commits[*].author.name`。
+    - `author_email`：来自 `commits[*].author.email`。
+    - `distinct`：来自 `commits[*].distinct`（布尔值，标识该提交是否在此次 push 中为"新"）。
+    - `url`：来自 `commits[*].url`。
+    - （可选派生）`message_length`：提交信息长度，用于简单语义分析。
+  - 语义属性（基于整小时事件与图结构计算）：
+    - `significance_score`：提交在该一小时内的重要性评分（0～1），基于所属 PushEvent 的重要性得分，并考虑提交信息长度（可能反映重要程度）等因素。数值越高，表示该提交在当前时间窗口内越“关键”。
 - **校验规则 / 约束**：
   - 仅当事件类型为 `PushEvent` 且 `payload.commits` 为非空列表时创建提交节点。
   - 同一 `commit_sha` 在全图中只创建一个节点；若多个 PushEvent 引用同一提交，仅通过多条边连接到相同节点。
@@ -111,9 +114,12 @@
 - **创建条件**：
   - 事件包含有效 `repo` 字段且成功创建了对应的仓库节点。
 - **关键属性字段**：
-  - `type`：固定值 `"EVENT_TARGETS_REPOSITORY"`。
-  - `created_at`：复用事件的 `created_at`。
-  - （可选）`event_type`：冗余记录事件类型（如 `PushEvent`），方便按边过滤。
+  - 基础属性：
+    - `type`：固定值 `"EVENT_TARGETS_REPOSITORY"`。
+    - `created_at`：复用事件的 `created_at`。
+    - （可选）`event_type`：冗余记录事件类型（如 `PushEvent`），方便按边过滤。
+  - 语义属性：
+    - `impact_score`：该事件对该仓库的影响评分（0～1），通常定义为“事件重要性评分”，用于衡量该次行为对该仓库的影响强度。
 
 ---
 
@@ -125,9 +131,12 @@
 - **创建条件**：
   - 事件类型为 `PushEvent`，并成功解析出 `payload.commits[*].sha`。
 - **关键属性字段**：
-  - `type`：固定值 `"EVENT_CONTAINS_COMMIT"`。
-  - `created_at`：复用事件 `created_at`。
-  - （可选）`distinct`：从对应提交节点的 `distinct` 属性中冗余，便于直接在边上做过滤。
+  - 基础属性：
+    - `type`：固定值 `"EVENT_CONTAINS_COMMIT"`。
+    - `created_at`：复用事件 `created_at`。
+    - （可选）`distinct`：从对应提交节点的 `distinct` 属性中冗余，便于直接在边上做过滤。
+  - 语义属性：
+    - `relevance_score`：该事件与该提交的关联强度评分（0～1），通常定义为“事件重要性评分 × 提交重要性评分”，用于衡量该提交在此次 PushEvent 中的相对重要性。
 
 ---
 

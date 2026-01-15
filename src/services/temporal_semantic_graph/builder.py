@@ -26,6 +26,8 @@ def build_temporal_semantic_graph(
     events: Iterable[Dict[str, Any]],
     actor_influence: Optional[Dict[int, float]] = None,
     event_importance: Optional[Dict[str, float]] = None,
+    repo_activity: Optional[Dict[int, float]] = None,
+    commit_significance: Optional[Dict[str, float]] = None,
 ) -> nx.DiGraph:
     """
     从事件列表构建时序语义图（MVP 版本，结构正确为主）。
@@ -41,6 +43,8 @@ def build_temporal_semantic_graph(
         events: 事件字典可迭代对象
         actor_influence: 开发者影响力评分映射（actor_id -> influence_score，0～1），可选
         event_importance: 事件重要性评分映射（event_id -> importance_score，0～1），可选
+        repo_activity: 仓库活跃度评分映射（repo_id -> activity_score，0～1），可选
+        commit_significance: 提交重要性评分映射（commit_sha -> significance_score，0～1），可选
 
     Returns:
         NetworkX 有向图对象
@@ -48,6 +52,8 @@ def build_temporal_semantic_graph(
     graph = nx.DiGraph()
     actor_influence = actor_influence or {}
     event_importance = event_importance or {}
+    repo_activity = repo_activity or {}
+    commit_significance = commit_significance or {}
 
     # 先将事件收集为列表并按时间排序
     normalized_events = []
@@ -107,36 +113,49 @@ def build_temporal_semantic_graph(
         if repo_id is not None:
             repo_node_id = f"repo:{repo_id}"
             if repo_node_id not in graph:
-                graph.add_node(repo_node_id, **make_repo_attributes(repo))
+                repo_attrs = make_repo_attributes(repo)
+                activity_score = float(repo_activity.get(repo_id, 0.0))
+                repo_attrs["activity_score"] = activity_score
+                graph.add_node(repo_node_id, **repo_attrs)
             # 事件 → 仓库
             if not graph.has_edge(event_node_id, repo_node_id):
+                importance_score = float(event_importance.get(event_id, 0.0))
+                impact_score = importance_score  # 直接使用事件重要性作为影响评分
                 graph.add_edge(
                     event_node_id,
                     repo_node_id,
                     type="EVENT_TARGETS_REPOSITORY",
                     created_at=created_at,
                     event_type=event_type,
+                    impact_score=impact_score,
                 )
 
         # -------- 提交节点与边（PushEvent） --------
         if event_type == "PushEvent":
             payload = ev.get("payload") or {}
             commits = payload.get("commits") or []
+            importance_score = float(event_importance.get(event_id, 0.0))
             for commit in commits:
                 sha = commit.get("sha")
                 if not sha:
                     continue
                 commit_node_id = f"commit:{sha}"
                 if commit_node_id not in graph:
-                    graph.add_node(commit_node_id, **make_commit_attributes(commit))
+                    commit_attrs = make_commit_attributes(commit)
+                    significance_score = float(commit_significance.get(sha, 0.0))
+                    commit_attrs["significance_score"] = significance_score
+                    graph.add_node(commit_node_id, **commit_attrs)
                 # 事件 → 提交
                 if not graph.has_edge(event_node_id, commit_node_id):
+                    significance_score = float(commit_significance.get(sha, 0.0))
+                    relevance_score = importance_score * significance_score
                     graph.add_edge(
                         event_node_id,
                         commit_node_id,
                         type="EVENT_CONTAINS_COMMIT",
                         created_at=created_at,
                         distinct=commit.get("distinct"),
+                        relevance_score=relevance_score,
                     )
 
     logger.info(

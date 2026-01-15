@@ -63,6 +63,10 @@ def run_temporal_graph_pipeline(
     event_importance_raw: Dict[str, float] = {}
     actor_influence_raw: Dict[int, float] = defaultdict(float)
     actor_repo_set: Dict[int, set] = defaultdict(set)
+    # 仓库活跃度与提交重要性评分（新增）
+    repo_activity_raw: Dict[int, float] = defaultdict(float)
+    repo_actor_set: Dict[int, set] = defaultdict(set)  # 每个仓库参与的不同开发者
+    commit_significance_raw: Dict[str, float] = {}  # commit_sha -> raw significance
 
     # 事件类型权重（可根据研究需要调整）
     type_weights: Dict[str, float] = {
@@ -95,12 +99,34 @@ def run_temporal_graph_pipeline(
 
         actor = ev.get("actor") or {}
         actor_id = actor.get("id")
+        repo = ev.get("repo") or {}
+        repo_id = repo.get("id")
+
+        # 仓库活跃度：累加事件重要性，并记录参与的开发者
+        if repo_id is not None:
+            repo_activity_raw[repo_id] += raw_imp
+            if actor_id is not None:
+                repo_actor_set[repo_id].add(actor_id)
+
         if actor_id is not None:
             actor_influence_raw[actor_id] += raw_imp
-            repo = ev.get("repo") or {}
-            repo_id = repo.get("id")
             if repo_id is not None:
                 actor_repo_set[actor_id].add(repo_id)
+
+        # 提交重要性：基于所属 PushEvent 的重要性和提交信息长度
+        if event_type == "PushEvent" and commits:
+            for commit in commits:
+                sha = commit.get("sha")
+                if not sha:
+                    continue
+                message = commit.get("message") or ""
+                message_length = len(message)
+                # message_factor = 1 + β * log1p(message_length)，β = 0.1
+                message_factor = 1.0 + 0.1 * math.log1p(message_length)
+                # 如果同一提交出现在多个 PushEvent 中，取最大值
+                commit_significance_raw[sha] = max(
+                    commit_significance_raw.get(sha, 0.0), raw_imp * message_factor
+                )
 
     # 为跨仓库活动增加一点加成（对数缩放，避免线性放大过强）
     cross_repo_alpha = 0.5
@@ -108,6 +134,13 @@ def run_temporal_graph_pipeline(
         repo_count = len(repos)
         if repo_count > 0:
             actor_influence_raw[actor_id] += cross_repo_alpha * math.log1p(repo_count)
+
+    # 为仓库活跃度增加参与开发者数量的加成（对数缩放）
+    participation_alpha = 0.3
+    for repo_id, actors in repo_actor_set.items():
+        actor_count = len(actors)
+        if actor_count > 0:
+            repo_activity_raw[repo_id] += participation_alpha * math.log1p(actor_count)
 
     def _min_max_normalize(scores: Dict) -> Dict:
         """
@@ -130,6 +163,8 @@ def run_temporal_graph_pipeline(
 
     event_importance = _min_max_normalize(event_importance_raw)
     actor_influence = _min_max_normalize(actor_influence_raw)
+    repo_activity = _min_max_normalize(repo_activity_raw)
+    commit_significance = _min_max_normalize(commit_significance_raw)
 
     # 3. 按分钟分组并为每个分钟构建独立图
     # 键格式示例：2015-01-01-15-00
@@ -151,7 +186,11 @@ def run_temporal_graph_pipeline(
 
     for minute_key, minute_events in sorted(groups.items()):
         graph: nx.DiGraph = build_temporal_semantic_graph(
-            minute_events, actor_influence=actor_influence, event_importance=event_importance
+            minute_events,
+            actor_influence=actor_influence,
+            event_importance=event_importance,
+            repo_activity=repo_activity,
+            commit_significance=commit_significance,
         )
 
         for fmt in export_formats:

@@ -94,6 +94,26 @@ python -m src.cli.main temporal-semantic-graph \
         "importance_score": 0.82,
         "...": "..."
       }
+    },
+    {
+      "id": "repo:12345",
+      "type": "Repository",
+      "attributes": {
+        "repo_id": 12345,
+        "name": "owner/repo",
+        "activity_score": 0.65,
+        "...": "..."
+      }
+    },
+    {
+      "id": "commit:abc123",
+      "type": "Commit",
+      "attributes": {
+        "commit_sha": "abc123",
+        "message": "Fix bug",
+        "significance_score": 0.58,
+        "...": "..."
+      }
     }
   ],
   "edges": [
@@ -106,6 +126,27 @@ python -m src.cli.main temporal-semantic-graph \
         "created_at": "2015-01-01T15:00:01Z",
         "contribution_strength": 0.73
       }
+    },
+    {
+      "id": "event:2489651051->repo:12345",
+      "type": "EVENT_TARGETS_REPOSITORY",
+      "source": "event:2489651051",
+      "target": "repo:12345",
+      "attributes": {
+        "created_at": "2015-01-01T15:00:01Z",
+        "event_type": "PushEvent",
+        "impact_score": 0.82
+      }
+    },
+    {
+      "id": "event:2489651051->commit:abc123",
+      "type": "EVENT_CONTAINS_COMMIT",
+      "source": "event:2489651051",
+      "target": "commit:abc123",
+      "attributes": {
+        "created_at": "2015-01-01T15:00:01Z",
+        "relevance_score": 0.48
+      }
     }
   ]
 }
@@ -115,16 +156,21 @@ python -m src.cli.main temporal-semantic-graph \
 
 - `nodes` 与 `edges` 均为数组；
 - 每个节点有：
-  - `id`：在全图内唯一，可组合前缀（如 `event:`、`actor:` 等）；
+  - `id`：在全图内唯一，可组合前缀（如 `event:`、`actor:`、`repo:`、`commit:` 等）；
   - `type`：节点类型（`Event` / `Actor` / `Repository` / `Commit`）；
-  - `attributes`：包含来自原始数据或派生的语义属性，例如：
-    - Event 节点的 `event_id`、`event_type`、`created_at`、`importance_score`（0～1）； 
-    - Actor 节点的 `actor_id`、`login`、`influence_score`（0～1）等。
+  - `attributes`：包含来自原始数据或派生的语义属性，常见语义字段包括：
+    - Event 节点的 `importance_score`（0～1）；
+    - Actor 节点的 `influence_score`（0～1）；
+    - Repository 节点的 `activity_score`（0～1）；
+    - Commit 节点的 `significance_score`（0～1）。
 - 每条边有：
   - `id`：在全图内唯一，可由 `source` 与 `target` 拼接；
-  - `type`：边类型，如 `"ACTOR_TRIGGERED_EVENT"` 等；
+  - `type`：边类型，如 `"ACTOR_TRIGGERED_EVENT"`、`"EVENT_TARGETS_REPOSITORY"`、`"EVENT_CONTAINS_COMMIT"` 等；
   - `source` / `target`：引用节点的 `id`；
-  - `attributes`：包含边级别的属性，如时间戳以及 `contribution_strength`（0～1，用于衡量该次行为的综合贡献强度）等。
+  - `attributes`：包含边级别的属性，如时间戳以及语义评分：
+    - ACTOR_TRIGGERED_EVENT 边的 `contribution_strength`（0～1）；
+    - EVENT_TARGETS_REPOSITORY 边的 `impact_score`（0～1）；
+    - EVENT_CONTAINS_COMMIT 边的 `relevance_score`（0～1）。
 
 ---
 

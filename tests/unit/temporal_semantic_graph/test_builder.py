@@ -101,3 +101,61 @@ def test_build_temporal_semantic_graph_basic():
     assert ts1 is not None and ts2 is not None and ts1 < ts2
 
 
+def test_build_temporal_semantic_graph_with_scores():
+    """
+    测试新增的语义评分属性（仓库活跃度、提交重要性、边评分）。
+    """
+    events = _make_sample_events()
+    # 模拟预计算的评分
+    mock_actor_influence = {1: 0.8, 2: 0.5}
+    mock_event_importance = {"e1": 0.9, "e2": 0.6}
+    mock_repo_activity = {100: 0.7, 200: 0.4}
+    mock_commit_significance = {"abc123": 0.55}
+
+    graph = build_temporal_semantic_graph(
+        events,
+        actor_influence=mock_actor_influence,
+        event_importance=mock_event_importance,
+        repo_activity=mock_repo_activity,
+        commit_significance=mock_commit_significance,
+    )
+
+    # 验证事件节点重要性
+    assert graph.nodes["event:e1"]["importance_score"] == 0.9
+    assert graph.nodes["event:e2"]["importance_score"] == 0.6
+
+    # 验证开发者节点影响力
+    assert graph.nodes["actor:1"]["influence_score"] == 0.8
+    assert graph.nodes["actor:2"]["influence_score"] == 0.5
+
+    # 验证仓库节点活跃度
+    assert graph.nodes["repo:100"]["activity_score"] == 0.7
+    assert graph.nodes["repo:200"]["activity_score"] == 0.4
+
+    # 验证提交节点重要性
+    assert graph.nodes["commit:abc123"]["significance_score"] == 0.55
+
+    # 验证开发者→事件边贡献强度
+    edge_e1_attrs = graph["actor:1"]["event:e1"]
+    assert "contribution_strength" in edge_e1_attrs
+    assert abs(edge_e1_attrs["contribution_strength"] - (0.8 * 0.9)) < 1e-6
+
+    edge_e2_attrs = graph["actor:2"]["event:e2"]
+    assert "contribution_strength" in edge_e2_attrs
+    assert abs(edge_e2_attrs["contribution_strength"] - (0.5 * 0.6)) < 1e-6
+
+    # 验证事件→仓库边影响评分（等于事件重要性）
+    event_repo_edge = graph["event:e1"]["repo:100"]
+    assert "impact_score" in event_repo_edge
+    assert event_repo_edge["impact_score"] == 0.9
+
+    event_repo_edge2 = graph["event:e2"]["repo:200"]
+    assert "impact_score" in event_repo_edge2
+    assert event_repo_edge2["impact_score"] == 0.6
+
+    # 验证事件→提交边关联强度（事件重要性 × 提交重要性）
+    event_commit_edge = graph["event:e2"]["commit:abc123"]
+    assert "relevance_score" in event_commit_edge
+    assert abs(event_commit_edge["relevance_score"] - (0.6 * 0.55)) < 1e-6
+
+
