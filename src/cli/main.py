@@ -125,6 +125,57 @@ def parse_arguments():
     )
 
     # 如果用户未提供子命令，则默认使用 snapshot 模式
+    # 同时需要为主解析器添加 snapshot 模式的参数，以保证向后兼容
+    parser.add_argument(
+        '--db',
+        type=str,
+        default='data/rxjs-ghtorrent.db',
+        help='SQLite数据库文件路径（默认: data/rxjs-ghtorrent.db）'
+    )
+
+    parser.add_argument(
+        '--output',
+        type=str,
+        default='output/',
+        help='输出目录路径（默认: output/）'
+    )
+
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='日志级别（默认: INFO）'
+    )
+
+    parser.add_argument(
+        '--start-date',
+        type=str,
+        default=None,
+        help='起始日期（YYYY-MM-DD格式），默认处理所有日期'
+    )
+
+    parser.add_argument(
+        '--end-date',
+        type=str,
+        default=None,
+        help='结束日期（YYYY-MM-DD格式），默认处理所有日期'
+    )
+
+    parser.add_argument(
+        '--format',
+        type=str,
+        default='graphml',
+        choices=['graphml', 'json'],
+        help='导出格式（默认: graphml）'
+    )
+
+    parser.add_argument(
+        '--remove-isolated',
+        action='store_true',
+        help='移除孤立节点（没有边的节点），使图更清晰便于分析'
+    )
+
     parser.set_defaults(command="snapshot")
 
     return parser.parse_args()
