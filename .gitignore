@@ -26,13 +26,12 @@ ENV/
 Thumbs.db
 
 # Logs
-logs/
-*.log
+logs/*.log
 
 # Output files
 output/
-*.graphml
-*.json
+output/*.graphml
+output/*.json
 
 # Python build artifacts
 dist/
