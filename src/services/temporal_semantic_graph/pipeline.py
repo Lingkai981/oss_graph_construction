@@ -2,6 +2,11 @@
 时序语义图构建流水线
 
 负责将加载、构图与导出串联起来，供 CLI 子命令调用。
+支持四种图模式：
+1. event-centric: 原始的以事件为中心的异构图
+2. actor-repo: Actor-Repository 投影图
+3. actor-actor: Actor-Actor 协作图
+4. actor-discussion: Actor-Discussion 二部图（Issue/PR 讨论图）
 """
 
 from __future__ import annotations
@@ -17,9 +22,16 @@ from src.services.exporter import (
     ensure_output_directory,
     export_temporal_graph_to_json,
     export_temporal_graph_to_graphml,
+    export_projection_graph_to_json,
+    export_projection_graph_to_graphml,
 )
 from src.services.temporal_semantic_graph.loader import load_events_from_file
 from src.services.temporal_semantic_graph.builder import build_temporal_semantic_graph
+from src.services.temporal_semantic_graph.projection_builder import (
+    build_actor_repo_graph,
+    build_actor_actor_graph,
+    build_actor_discussion_graph,
+)
 from src.utils.date_utils import parse_timestamp
 from src.utils.logger import get_logger
 
@@ -59,16 +71,14 @@ def run_temporal_graph_pipeline(
     if not events:
         logger.warning("未从输入文件中解析到任何事件，本次不会生成任何快照图")
 
-    # 2. 基于整小时事件预计算语义评分（事件重要性与开发者影响力）
+    # 2. 基于整小时事件预计算语义评分
     event_importance_raw: Dict[str, float] = {}
     actor_influence_raw: Dict[int, float] = defaultdict(float)
     actor_repo_set: Dict[int, set] = defaultdict(set)
-    # 仓库活跃度与提交重要性评分（新增）
     repo_activity_raw: Dict[int, float] = defaultdict(float)
-    repo_actor_set: Dict[int, set] = defaultdict(set)  # 每个仓库参与的不同开发者
-    commit_significance_raw: Dict[str, float] = {}  # commit_sha -> raw significance
+    repo_actor_set: Dict[int, set] = defaultdict(set)
+    commit_significance_raw: Dict[str, float] = {}
 
-    # 事件类型权重（可根据研究需要调整）
     type_weights: Dict[str, float] = {
         "PushEvent": 3.0,
         "CreateEvent": 2.0,
@@ -87,14 +97,12 @@ def run_temporal_graph_pipeline(
 
         payload = ev.get("payload") or {}
         commits = payload.get("commits") or []
-        # 对 PushEvent 使用提交数的对数放大，其余事件暂时不使用 commits 因子
         if event_type == "PushEvent" and commits:
             commit_factor = math.log1p(len(commits))
         else:
             commit_factor = 1.0
 
         raw_imp = base * commit_factor
-        # 事件 ID 在 GitHub 归档中应是全局唯一，因此直接赋值即可
         event_importance_raw[event_id] = raw_imp
 
         actor = ev.get("actor") or {}
@@ -102,7 +110,6 @@ def run_temporal_graph_pipeline(
         repo = ev.get("repo") or {}
         repo_id = repo.get("id")
 
-        # 仓库活跃度：累加事件重要性，并记录参与的开发者
         if repo_id is not None:
             repo_activity_raw[repo_id] += raw_imp
             if actor_id is not None:
@@ -113,7 +120,6 @@ def run_temporal_graph_pipeline(
             if repo_id is not None:
                 actor_repo_set[actor_id].add(repo_id)
 
-        # 提交重要性：基于所属 PushEvent 的重要性和提交信息长度
         if event_type == "PushEvent" and commits:
             for commit in commits:
                 sha = commit.get("sha")
@@ -121,21 +127,17 @@ def run_temporal_graph_pipeline(
                     continue
                 message = commit.get("message") or ""
                 message_length = len(message)
-                # message_factor = 1 + β * log1p(message_length)，β = 0.1
                 message_factor = 1.0 + 0.1 * math.log1p(message_length)
-                # 如果同一提交出现在多个 PushEvent 中，取最大值
                 commit_significance_raw[sha] = max(
                     commit_significance_raw.get(sha, 0.0), raw_imp * message_factor
                 )
 
-    # 为跨仓库活动增加一点加成（对数缩放，避免线性放大过强）
     cross_repo_alpha = 0.5
     for actor_id, repos in actor_repo_set.items():
         repo_count = len(repos)
         if repo_count > 0:
             actor_influence_raw[actor_id] += cross_repo_alpha * math.log1p(repo_count)
 
-    # 为仓库活跃度增加参与开发者数量的加成（对数缩放）
     participation_alpha = 0.3
     for repo_id, actors in repo_actor_set.items():
         actor_count = len(actors)
@@ -143,12 +145,6 @@ def run_temporal_graph_pipeline(
             repo_activity_raw[repo_id] += participation_alpha * math.log1p(actor_count)
 
     def _min_max_normalize(scores: Dict) -> Dict:
-        """
-        对原始得分做 min-max 归一化，映射到 [0, 1] 区间。
-
-        - 若所有值相同且 > 0，则统一设为 1.0，以保留“有贡献”的语义；
-        - 若所有值 <= 0，则统一设为 0.0。
-        """
         if not scores:
             return {}
         values = list(scores.values())
@@ -166,8 +162,7 @@ def run_temporal_graph_pipeline(
     repo_activity = _min_max_normalize(repo_activity_raw)
     commit_significance = _min_max_normalize(commit_significance_raw)
 
-    # 3. 按分钟分组并为每个分钟构建独立图
-    # 键格式示例：2015-01-01-15-00
+    # 3. 按分钟分组
     groups: dict[str, list[dict]] = {}
     for ev in events:
         created_at = ev.get("created_at")
@@ -218,3 +213,118 @@ def run_temporal_graph_pipeline(
     return generated_files
 
 
+def run_projection_graph_pipeline(
+    input_path: str,
+    output_dir: str = "output/projection-graphs/",
+    export_formats: Iterable[str] = ("json", "graphml"),
+    graph_mode: str = "all",
+    include_watch_events: bool = False,
+    include_fork_events: bool = True,
+    include_shared_repo_edges: bool = True,
+    min_shared_repos: int = 1,
+) -> List[str]:
+    """
+    运行投影图构建流水线。
+    
+    构建 Actor-Repository / Actor-Actor / Actor-Discussion 投影图，
+    将事件作为边属性而非独立节点，更适合社区分析算法。
+    
+    Args:
+        input_path: GitHub 事件 JSON 行文件路径
+        output_dir: 导出文件目录
+        export_formats: 需要导出的格式集合
+        graph_mode: 图模式 (actor-repo / actor-actor / actor-discussion / all)
+        include_watch_events: Actor-Repo 图是否包含 WatchEvent
+        include_fork_events: Actor-Repo 图是否包含 ForkEvent
+        include_shared_repo_edges: Actor-Actor 图是否包含共同仓库边
+        min_shared_repos: 共同仓库边的最小仓库数阈值
+    
+    Returns:
+        实际生成的导出文件路径列表
+    """
+    export_formats = list(export_formats)
+    logger.info("=" * 60)
+    logger.info("开始构建投影图")
+    logger.info(f"输入文件: {input_path}")
+    logger.info(f"输出目录: {output_dir}")
+    logger.info(f"导出格式: {', '.join(export_formats)}")
+    logger.info(f"图模式: {graph_mode}")
+    
+    # 1. 加载事件
+    events = load_events_from_file(input_path)
+    if not events:
+        logger.warning("未从输入文件中解析到任何事件，本次不会生成任何图")
+        return []
+    
+    logger.info(f"已加载 {len(events)} 条事件")
+    
+    # 2. 根据时间窗口提取标识
+    first_event_time = None
+    for ev in events:
+        created_at = ev.get("created_at")
+        if created_at:
+            dt = parse_timestamp(created_at)
+            if dt:
+                first_event_time = dt.strftime("%Y-%m-%d-%H")
+                break
+    
+    time_label = first_event_time or "unknown"
+    
+    # 3. 构建图
+    graphs_to_export = {}
+    
+    if graph_mode in ("actor-repo", "all"):
+        logger.info("构建 Actor-Repository 投影图...")
+        actor_repo_graph = build_actor_repo_graph(
+            events,
+            include_watch_events=include_watch_events,
+            include_fork_events=include_fork_events,
+        )
+        graphs_to_export["actor-repo"] = actor_repo_graph
+    
+    if graph_mode in ("actor-actor", "all"):
+        logger.info("构建 Actor-Actor 协作图...")
+        actor_actor_graph = build_actor_actor_graph(
+            events,
+            include_shared_repo_edges=include_shared_repo_edges,
+            min_shared_repos=min_shared_repos,
+        )
+        graphs_to_export["actor-actor"] = actor_actor_graph
+    
+    if graph_mode in ("actor-discussion", "all"):
+        logger.info("构建 Actor-Discussion 二部图（Issue/PR 讨论图）...")
+        actor_discussion_graph = build_actor_discussion_graph(events)
+        graphs_to_export["actor-discussion"] = actor_discussion_graph
+    
+    # 4. 导出
+    output_path = ensure_output_directory(output_dir)
+    generated_files: List[str] = []
+    
+    for graph_name, graph in graphs_to_export.items():
+        for fmt in export_formats:
+            fmt_lower = fmt.lower()
+            if fmt_lower not in ("json", "graphml"):
+                logger.warning(f"忽略不支持的导出格式: {fmt}")
+                continue
+            
+            filename = f"{graph_name}-{time_label}.{fmt_lower}"
+            file_path = output_path / filename
+            
+            if fmt_lower == "json":
+                export_projection_graph_to_json(
+                    graph,
+                    str(file_path),
+                    source_file=str(input_path),
+                    graph_type=graph_name,
+                )
+            else:
+                export_projection_graph_to_graphml(graph, str(file_path))
+            
+            generated_files.append(str(file_path))
+    
+    logger.info(f"投影图构建与导出完成，共生成 {len(generated_files)} 个文件")
+    for fp in generated_files:
+        logger.info(f"生成文件: {fp}")
+    
+    logger.info("=" * 60)
+    return generated_files

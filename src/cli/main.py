@@ -12,7 +12,10 @@ from src.services.database import connect_database
 from src.services.extractor import extract_all_dates, extract_data_for_date
 from src.services.graph_builder import build_all_snapshots
 from src.services.exporter import export_all_snapshots
-from src.services.temporal_semantic_graph.pipeline import run_temporal_graph_pipeline
+from src.services.temporal_semantic_graph.pipeline import (
+    run_temporal_graph_pipeline,
+    run_projection_graph_pipeline,
+)
 from src.utils.logger import setup_logger, get_logger
 
 
@@ -117,6 +120,74 @@ def parse_arguments():
     )
 
     temporal_parser.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='日志级别（默认: INFO）'
+    )
+
+    # -------- 投影图（Actor-Repo / Actor-Actor / Actor-Discussion） --------
+    projection_parser = subparsers.add_parser(
+        "projection-graph",
+        help="构建投影图（Actor-Repository / Actor-Actor / Actor-Discussion），适合社区分析"
+    )
+
+    projection_parser.add_argument(
+        '--input',
+        type=str,
+        default='data/2015-01-01-15.json',
+        help='GitHub 事件 JSON 行文件路径（默认: data/2015-01-01-15.json）'
+    )
+
+    projection_parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='output/projection-graphs/',
+        help='输出目录路径（默认: output/projection-graphs/）'
+    )
+
+    projection_parser.add_argument(
+        '--export-format',
+        type=str,
+        default='json,graphml',
+        help='导出格式，逗号分隔（可选: json, graphml，默认: json,graphml）'
+    )
+
+    projection_parser.add_argument(
+        '--graph-mode',
+        type=str,
+        default='all',
+        choices=['actor-repo', 'actor-actor', 'actor-discussion', 'all'],
+        help='图模式: actor-repo（Actor-Repository二分图）、actor-actor（协作图）、actor-discussion（Issue/PR讨论图）、all（全部生成，默认）'
+    )
+
+    projection_parser.add_argument(
+        '--include-watch',
+        action='store_true',
+        help='Actor-Repo 图是否包含 WatchEvent（Star 行为，默认不包含）'
+    )
+
+    projection_parser.add_argument(
+        '--exclude-fork',
+        action='store_true',
+        help='Actor-Repo 图是否排除 ForkEvent（默认包含）'
+    )
+
+    projection_parser.add_argument(
+        '--no-shared-repo-edges',
+        action='store_true',
+        help='Actor-Actor 图是否不包含基于共同仓库的协作边（默认包含）'
+    )
+
+    projection_parser.add_argument(
+        '--min-shared-repos',
+        type=int,
+        default=1,
+        help='Actor-Actor 图中基于共同仓库建立边的最小仓库数阈值（默认: 1）'
+    )
+
+    projection_parser.add_argument(
         '--log-level',
         type=str,
         default='INFO',
@@ -326,18 +397,58 @@ def _run_temporal_semantic_mode(args) -> None:
         sys.exit(1)
 
 
+def _run_projection_graph_mode(args) -> None:
+    """
+    投影图建模模式（Actor-Repository / Actor-Actor / Actor-Discussion）。
+    """
+    logger = setup_logger(log_level=args.log_level)
+    logger.info("=" * 60)
+    logger.info("开始投影图建模（projection-graph 模式）")
+    logger.info("=" * 60)
+
+    try:
+        formats = _parse_export_formats(args.export_format)
+        generated_files = run_projection_graph_pipeline(
+            input_path=args.input,
+            output_dir=args.output_dir,
+            export_formats=formats,
+            graph_mode=args.graph_mode,
+            include_watch_events=args.include_watch,
+            include_fork_events=not args.exclude_fork,
+            include_shared_repo_edges=not args.no_shared_repo_edges,
+            min_shared_repos=args.min_shared_repos,
+        )
+        logger.info(f"导出文件数: {len(generated_files)}")
+        for fp in generated_files:
+            logger.info(f"导出文件: {fp}")
+
+        logger.info("=" * 60)
+        logger.info("投影图建模完成")
+        logger.info("=" * 60)
+    except FileNotFoundError as e:
+        logger.error(f"文件未找到: {str(e)}")
+        logger.error("请检查输入事件文件路径是否正确")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"处理过程中发生错误: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+
 def main():
     """
     主函数
 
-    提供两种模式：
+    提供三种模式：
     - snapshot: 原有的按天快照式时序图建模（001 特性）；
-    - temporal-semantic-graph: 基于 GitHub 事件的一小时时序语义图建模（002 特性）。
+    - temporal-semantic-graph: 基于 GitHub 事件的一小时时序语义图建模（002 特性）；
+    - projection-graph: 投影图建模（Actor-Repository / Actor-Actor / Actor-Discussion）。
     """
     args = parse_arguments()
 
     if args.command == "temporal-semantic-graph":
         _run_temporal_semantic_mode(args)
+    elif args.command == "projection-graph":
+        _run_projection_graph_mode(args)
     else:
         # 默认或显式 snapshot 命令
         _run_snapshot_mode(args)

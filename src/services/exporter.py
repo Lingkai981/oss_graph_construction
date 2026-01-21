@@ -243,3 +243,164 @@ def export_temporal_graph_to_graphml(graph: nx.DiGraph, output_path: str) -> Non
         logger.error(f"导出时序语义图 GraphML 失败: {output_path}, 错误: {str(e)}")
         raise
 
+
+# ========== 投影图专用导出函数 ==========
+
+
+def _serialize_value(value: object) -> object:
+    """
+    将复杂类型序列化为 JSON 兼容格式。
+    """
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, dict):
+        return {k: _serialize_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_serialize_value(v) for v in value]
+    return value
+
+
+def export_projection_graph_to_json(
+    graph: nx.Graph,
+    output_path: str,
+    source_file: str,
+    graph_type: str,
+) -> None:
+    """
+    将投影图导出为 JSON 格式。
+    
+    支持普通图和多重图（MultiGraph/MultiDiGraph）。
+    
+    结构：
+    {
+      "meta": {
+        "source_file": "...",
+        "generated_at": "...",
+        "graph_type": "actor_repo" | "actor_actor",
+        "node_count": ...,
+        "edge_count": ...,
+        "is_directed": true | false,
+        "is_multigraph": true | false
+      },
+      "nodes": [...],
+      "edges": [...]
+    }
+    """
+    is_multigraph = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    
+    meta = {
+        "source_file": source_file,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "graph_type": graph_type,
+        "node_count": graph.number_of_nodes(),
+        "edge_count": graph.number_of_edges(),
+        "is_directed": graph.is_directed(),
+        "is_multigraph": is_multigraph,
+    }
+    
+    nodes = []
+    for node_id, data in graph.nodes(data=True):
+        node_type = data.get("node_type", "Unknown")
+        attrs = {k: _serialize_value(v) for k, v in data.items() if k != "node_type"}
+        nodes.append({
+            "id": node_id,
+            "type": node_type,
+            "attributes": attrs,
+        })
+    
+    edges = []
+    if is_multigraph:
+        # 多重图：使用 edges(data=True, keys=True) 获取每条边的 key
+        for u, v, key, data in graph.edges(data=True, keys=True):
+            edge_type = data.get("edge_type", "UNKNOWN")
+            event_id = data.get("event_id", "")
+            attrs = {k: _serialize_value(v_val) for k, v_val in data.items() if k != "edge_type"}
+            # 使用 event_id 或 key 来确保边 ID 唯一
+            edge_id = f"{u}->{v}:{event_id}" if event_id else f"{u}->{v}:{key}"
+            edges.append({
+                "id": edge_id,
+                "type": edge_type,
+                "source": u,
+                "target": v,
+                "key": key,
+                "attributes": attrs,
+            })
+    else:
+        # 普通图
+        for u, v, data in graph.edges(data=True):
+            edge_type = data.get("edge_type", "UNKNOWN")
+            attrs = {k: _serialize_value(v_val) for k, v_val in data.items() if k != "edge_type"}
+            edges.append({
+                "id": f"{u}->{v}",
+                "type": edge_type,
+                "source": u,
+                "target": v,
+                "attributes": attrs,
+            })
+    
+    payload = {"meta": meta, "nodes": nodes, "edges": edges}
+    
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info(f"投影图 JSON 文件已导出: {output_path}")
+    except Exception as e:
+        logger.error(f"导出投影图 JSON 失败: {output_path}, 错误: {str(e)}")
+        raise
+
+
+def export_projection_graph_to_graphml(
+    graph: nx.Graph,
+    output_path: str,
+) -> None:
+    """
+    将投影图导出为 GraphML 格式。
+    
+    支持普通图和多重图（MultiGraph/MultiDiGraph）。
+    注意：GraphML 不支持复杂类型（如 list/dict/None），需要先序列化。
+    """
+    is_multigraph = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    
+    # 创建副本并序列化复杂属性
+    if is_multigraph:
+        if graph.is_directed():
+            export_graph = nx.MultiDiGraph()
+        else:
+            export_graph = nx.MultiGraph()
+    else:
+        if graph.is_directed():
+            export_graph = nx.DiGraph()
+        else:
+            export_graph = nx.Graph()
+    
+    def _safe_value(v):
+        """将值转换为 GraphML 支持的格式"""
+        if v is None:
+            return ""  # None 转为空字符串
+        if isinstance(v, (dict, list, set)):
+            return json.dumps(_serialize_value(v), ensure_ascii=False)
+        if isinstance(v, bool):
+            return str(v).lower()  # True -> "true"
+        return v
+    
+    for node_id, data in graph.nodes(data=True):
+        serialized_data = {k: _safe_value(v) for k, v in data.items()}
+        export_graph.add_node(node_id, **serialized_data)
+    
+    if is_multigraph:
+        # 多重图：保留每条边
+        for u, v, key, data in graph.edges(data=True, keys=True):
+            serialized_data = {k: _safe_value(v_val) for k, v_val in data.items()}
+            export_graph.add_edge(u, v, key=key, **serialized_data)
+    else:
+        for u, v, data in graph.edges(data=True):
+            serialized_data = {k: _safe_value(v_val) for k, v_val in data.items()}
+            export_graph.add_edge(u, v, **serialized_data)
+    
+    try:
+        nx.write_graphml(export_graph, output_path)
+        logger.info(f"投影图 GraphML 文件已导出: {output_path}")
+    except Exception as e:
+        logger.error(f"导出投影图 GraphML 失败: {output_path}, 错误: {str(e)}")
+        raise
+

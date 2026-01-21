@@ -27,6 +27,7 @@ Thumbs.db
 
 # Logs
 logs/*.log
+data/filtered/
 
 # Output files
 output/
