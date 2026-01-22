@@ -270,10 +270,13 @@ def build_actor_actor_graph(
                         _ensure_actor(issue_user)
                 
                 if creator_id and creator_id != actor_id:
+                    comment = payload.get("comment") or {}
+                    comment_body = comment.get("body", "")
                     edges.append({
                         "source": actor_id, "target": creator_id,
                         "edge_type": "ISSUE_INTERACTION",
                         "event_id": event_id, "created_at": created_at,
+                        "comment_body": comment_body,
                     })
         
         elif event_type == "PullRequestReviewCommentEvent":
@@ -289,10 +292,13 @@ def build_actor_actor_graph(
                         _ensure_actor(pr_user)
                 
                 if creator_id and creator_id != actor_id:
+                    comment = payload.get("comment") or {}
+                    comment_body = comment.get("body", "")
                     edges.append({
                         "source": actor_id, "target": creator_id,
                         "edge_type": "PR_REVIEW",
                         "event_id": event_id, "created_at": created_at,
+                        "comment_body": comment_body,
                     })
         
         elif event_type == "PullRequestEvent":
@@ -345,7 +351,8 @@ def build_actor_actor_graph(
         edge_key = f"{edge_data['edge_type']}_{edge_data['event_id']}"
         graph.add_edge(source, target, key=edge_key,
                        edge_type=edge_data["edge_type"],
-                       created_at=edge_data.get("created_at") or "")
+                       created_at=edge_data.get("created_at") or "",
+                       comment_body=edge_data.get("comment_body", ""))
     
     graph.graph["repo_name"] = repo_name
     graph.graph["month"] = month
@@ -417,13 +424,20 @@ def build_actor_repo_graph(
             "ReleaseEvent": "RELEASE",
         }
         edge_type = edge_type_map.get(event_type, event_type)
-        
+
+        # 只有“评论类事件”才有正文
+        comment_body = ""
+        if event_type in ("IssueCommentEvent", "PullRequestReviewCommentEvent"):
+            comment = (event.get("payload") or {}).get("comment") or {}
+            comment_body = comment.get("body", "") or ""
+
         edges.append({
             "actor_id": actor_id,
             "repo_id": repo_id,
             "edge_type": edge_type,
             "event_id": event_id,
             "created_at": created_at,
+            "comment_body": comment_body,
         })
     
     # 添加节点
@@ -440,7 +454,8 @@ def build_actor_repo_graph(
         edge_key = f"{edge_data['edge_type']}_{edge_data['event_id']}"
         graph.add_edge(source, target, key=edge_key,
                        edge_type=edge_data["edge_type"],
-                       created_at=edge_data.get("created_at") or "")
+                       created_at=edge_data.get("created_at") or "",
+                       comment_body=edge_data.get("comment_body", ""))
     
     graph.graph["repo_name"] = repo_name
     graph.graph["month"] = month
