@@ -559,12 +559,17 @@ def build_actor_discussion_graph(
                 if issue_user.get("id"):
                     _ensure_actor(issue_user)
                 
+                # 获取评论正文（直接从事件数据中提取）
+                comment = payload.get("comment") or {}
+                comment_body = comment.get("body", "")
+
                 edges.append({
                     "actor_id": actor_id,
                     "discussion_key": key,
                     "edge_type": "COMMENTED_ISSUE",
                     "event_id": event_id,
                     "created_at": created_at,
+                    "comment_body": comment_body,
                 })
         
         elif event_type == "PullRequestEvent":
@@ -635,12 +640,16 @@ def build_actor_discussion_graph(
                 if pr_user.get("id"):
                     _ensure_actor(pr_user)
                 
+                # 获取评论正文（直接从事件数据中提取）
+                comment = payload.get("comment") or {}
+                comment_body = comment.get("body", "")
                 edges.append({
                     "actor_id": actor_id,
                     "discussion_key": key,
                     "edge_type": "REVIEWED_PR",
                     "event_id": event_id,
                     "created_at": created_at,
+                    "comment_body": comment_body,
                 })
     
     # 添加节点
@@ -657,7 +666,8 @@ def build_actor_discussion_graph(
         edge_key = f"{edge_data['edge_type']}_{edge_data['event_id']}"
         graph.add_edge(source, target, key=edge_key,
                        edge_type=edge_data["edge_type"],
-                       created_at=edge_data.get("created_at") or "")
+                       created_at=edge_data.get("created_at") or "",
+                       comment_body=edge_data.get("comment_body", ""))
     
     graph.graph["repo_name"] = repo_name
     graph.graph["month"] = month
