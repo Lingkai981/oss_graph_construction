@@ -46,3 +46,11 @@ build/
 # ppt文件
 *.pptx
 
+# ===== local data (DO NOT COMMIT) =====
+data/
+data/**
+*.parquet
+*.json.gz
+*.csv
+
+data/filtered/
