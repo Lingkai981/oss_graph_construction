@@ -35,6 +35,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import re
+
 import networkx as nx
 
 from src.utils.logger import get_logger
@@ -184,6 +186,36 @@ def _escape_xml_text(text: str) -> str:
             )
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def _sanitize_comment_text(text: str) -> str:
+    """
+    清洗评论正文/日志文本，使其可以作为 GraphML 文本安全写入：
+    - 去掉 ANSI 颜色控制序列（例如 [32m）
+    - 去掉 XML 1.0 不允许的控制字符（除了 \t \n \r）
+    其余内容原样保留，让 NetworkX/ElementTree 负责正常的 XML 转义。
+    """
+    if not text:
+        return ""
+
+    # 1) 去掉 ANSI 颜色控制序列
+    cleaned = _ANSI_ESCAPE_RE.sub("", text)
+
+    # 2) 过滤 XML 不允许的控制字符
+    return "".join(
+        ch
+        for ch in cleaned
+        if (
+            ch == "\t"
+            or ch == "\n"
+            or ch == "\r"
+            or 0x20 <= ord(ch) <= 0xD7FF
+            or 0xE000 <= ord(ch) <= 0xFFFD
+        )
+    )
+
+
 def build_actor_actor_graph(
     events: List[Dict],
     repo_name: str,
@@ -271,7 +303,7 @@ def build_actor_actor_graph(
                 
                 if creator_id and creator_id != actor_id:
                     comment = payload.get("comment") or {}
-                    comment_body = comment.get("body", "")
+                    comment_body = _sanitize_comment_text(comment.get("body", ""))
                     edges.append({
                         "source": actor_id, "target": creator_id,
                         "edge_type": "ISSUE_INTERACTION",
@@ -293,7 +325,7 @@ def build_actor_actor_graph(
                 
                 if creator_id and creator_id != actor_id:
                     comment = payload.get("comment") or {}
-                    comment_body = comment.get("body", "")
+                    comment_body = _sanitize_comment_text(comment.get("body", ""))
                     edges.append({
                         "source": actor_id, "target": creator_id,
                         "edge_type": "PR_REVIEW",
@@ -429,7 +461,7 @@ def build_actor_repo_graph(
         comment_body = ""
         if event_type in ("IssueCommentEvent", "PullRequestReviewCommentEvent"):
             comment = (event.get("payload") or {}).get("comment") or {}
-            comment_body = comment.get("body", "") or ""
+            comment_body = _sanitize_comment_text(comment.get("body", "") or "")
 
         edges.append({
             "actor_id": actor_id,
@@ -576,7 +608,7 @@ def build_actor_discussion_graph(
                 
                 # 获取评论正文（直接从事件数据中提取）
                 comment = payload.get("comment") or {}
-                comment_body = comment.get("body", "")
+                comment_body = _sanitize_comment_text(comment.get("body", ""))
 
                 edges.append({
                     "actor_id": actor_id,
@@ -657,7 +689,7 @@ def build_actor_discussion_graph(
                 
                 # 获取评论正文（直接从事件数据中提取）
                 comment = payload.get("comment") or {}
-                comment_body = comment.get("body", "")
+                comment_body = _sanitize_comment_text(comment.get("body", ""))
                 edges.append({
                     "actor_id": actor_id,
                     "discussion_key": key,

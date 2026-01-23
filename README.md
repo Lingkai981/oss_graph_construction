@@ -180,25 +180,38 @@ python -m src.analysis.community_atmosphere_analyzer \
       - `avg_diameter`：平均网络直径；
       - `avg_path_length`：平均路径长度。
 
-- **三大因子与权重**：
-  - **情绪因子（Emotion，40 分）**：
-    - 把 [-1, 1] 的 `avg_emotion` 线性映射到 [0, 1] 再乘以 40：
+- **三大因子与权重（调整后）**：
+  - **情绪因子（Emotion，20 分）**：
+    - 把 [-1, 1] 的 `avg_emotion` 线性映射到 [0, 1] 再乘以 20：
       - `emotion_norm = (avg_emotion + 1) / 2`（截断到 [0,1]）；
-      - `emotion_score = emotion_norm * 40`；
-    - 情绪越正向、越稳定，得分越高。
-  - **社区紧密度因子（Clustering，30 分）**：
-    - 将 `avg_clustering` 以 0.6 作为“非常紧密”的上限做归一化：
-      - `clustering_norm = min(1, avg_clustering / 0.6)`；
-      - `clustering_score = clustering_norm * 30`；
-    - 当社区局部聚类系数长期处于 0.6 以上时，视为满分。
-  - **网络效率因子（Network Efficiency，30 分）**：
-    - 预设“合理范围”：
-      - 直径 `avg_diameter` 约落在 [1, 6]；
-      - 平均路径 `avg_path_length` 约落在 [1, 3.5]；
-    - 在各自区间内将“越小越好”映射到 [0,1]：
-      - 直径分量：`diameter_component`，从 1（非常紧凑）到 0（非常松散）；
-      - 路径分量：`path_component`，从 1（平均路径最短）到 0（平均路径很长）；
-    - 再取两者平均得到 `network_norm`，乘以 30 得到 `network_score`。
+      - `emotion_score = emotion_norm * 20`；
+    - **权重降低原因**：技术讨论多为中性，情绪区分度有限，因此降低权重以突出结构指标。
+  - **社区紧密度因子（Clustering，40 分）**：
+    - 使用**平滑增长函数**进行归一化，避免线性映射对低值过于严格：
+      - 使用公式 `clustering_norm = 1 / (1 + 2.0 × (0.6 - clustering) / 0.6)`，平滑增长：
+        - 聚类系数 = 0 → 0.0
+        - 聚类系数 = 0.1 → 0.33
+        - 聚类系数 = 0.2 → 0.5
+        - 聚类系数 = 0.4 → 0.75
+        - 聚类系数 ≥ 0.6 → 1.0（满分）
+      - `clustering_score = clustering_norm * 40`；
+    - **归一化改进原因**：使用平滑函数可以让低聚类系数（0.1-0.2）的项目得到更合理的分数，而不是被线性映射压得很低，更好地反映不同规模项目的协作紧密程度。
+    - **权重提高原因**：聚类系数能有效反映社区成员间的紧密协作关系，区分度高，更能体现社区氛围质量。
+  - **网络效率因子（Network Efficiency，40 分）**：
+    - 使用**对数衰减函数**进行归一化，避免硬截断，适应不同规模的项目：
+      - **直径分量**：使用公式 `diameter_component = 1 / (1 + 0.3 × (diameter - 1))`，平滑衰减：
+        - 直径 = 1 → 1.0（满分）
+        - 直径 = 6 → 0.4
+        - 直径 = 10 → 0.23
+        - 直径 = 20 → 0.12（大项目仍有一定分数，不会完全为0）
+      - **路径长度分量**：使用公式 `path_component = 1 / (1 + 0.4 × (path_length - 1))`，平滑衰减：
+        - 路径长度 = 1 → 1.0（满分）
+        - 路径长度 = 3.5 → 0.5
+        - 路径长度 = 5 → 0.38
+        - 路径长度 = 8 → 0.22（大项目仍有一定分数，不会完全为0）
+    - 再取两者平均得到 `network_norm`，乘以 40 得到 `network_score`。
+    - **归一化改进原因**：大项目的网络直径和路径长度天然更大，使用对数衰减函数可以避免硬截断到0，让评分更公平地反映不同规模项目的网络效率。
+    - **权重提高原因**：网络效率反映信息传播效率和社区连通性，是衡量社区氛围的重要结构指标，区分度高。
 
 - **总分与等级**：
   - 总分范围 [0, 100]：  
@@ -244,23 +257,21 @@ python -m src.analysis.community_atmosphere_analyzer \
       "factors": {
         "emotion": {
           "value": 0.055,
-          "score": 21.1,
-          "weight": 40
+          "score": 13.2,
+          "weight": 20
         },
         "clustering": {
           "value": 0.047,
-          "score": 1.42,
-          "weight": 30
+          "score": 2.94,
+          "weight": 40
         },
-        "diameter": {
-          "value": 1.36,
-          "score": 18.64,
-          "weight": 20
-        },
-        "path_length": {
-          "value": 1.136,
-          "score": 8.86,
-          "weight": 10
+        "network_efficiency": {
+          "value": {
+            "average_diameter": 1.36,
+            "average_path_length": 1.136
+          },
+          "score": 27.5,
+          "weight": 40
         }
       }
     }

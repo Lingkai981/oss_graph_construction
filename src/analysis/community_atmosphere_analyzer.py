@@ -18,6 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import networkx as nx
 
@@ -120,6 +121,7 @@ class CommunityAtmosphereAnalyzer:
         graph: nx.Graph,
         repo_name: str = "",
         month: str = "",
+        max_workers: int = 4,
     ) -> Dict[str, float]:
         """
         从图的边中提取情感信息（使用DeepSeek API）
@@ -136,13 +138,13 @@ class CommunityAtmosphereAnalyzer:
             logger.error("DeepSeek API不可用，无法进行情感分析")
             return {}
         
-        sentiment_scores = {}
+        sentiment_scores: Dict[str, float] = {}
         edges_with_comment = 0
         edges_processed = 0
         edges_failed = 0
         
-        # 先收集所有有comment_body的边
-        edges_to_process = []
+        # 先收集所有有comment_body的边（去空白后非空）
+        edges_to_process: List[tuple[str, str]] = []
         
         # 根据图类型处理边：MultiDiGraph支持keys，DiGraph不支持
         if isinstance(graph, nx.MultiDiGraph):
@@ -170,30 +172,47 @@ class CommunityAtmosphereAnalyzer:
         total_edges = len(edges_to_process)
         print(f"{repo_name} {month}: 开始分析 {total_edges} 条边的情感（这可能需要几分钟）...", flush=True)
         logger.info(f"{repo_name} {month}: 开始分析 {total_edges} 条边的情感（这可能需要几分钟）...")
+        logger.info(f"{repo_name} {month}: 使用最多 {max_workers} 个线程并发调用 DeepSeek API")
         
-        # 处理每条边
-        for idx, (edge_id, comment_body) in enumerate(edges_to_process, 1):
+        # 并发处理每条边
+        def _analyze_single_edge(edge: tuple[str, str]) -> tuple[str, float, Optional[Exception]]:
+            edge_id, comment_body = edge
             try:
-                # 每处理1条边就显示进度（如果边数>5，或者每10条显示一次）
+                score = self.sentiment_client.analyze_sentiment(comment_body)
+                return edge_id, score, None
+            except Exception as e:
+                return edge_id, 0.0, e
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_edge_id = {
+                executor.submit(_analyze_single_edge, edge): edge[0]
+                for edge in edges_to_process
+            }
+            
+            for idx, future in enumerate(as_completed(future_to_edge_id), 1):
+                edge_id = future_to_edge_id[future]
+                
+                # 进度显示：边数少时每条打印，边数多时每10条打印一次
                 if total_edges > 5:
                     if total_edges <= 20:
-                        # 边数少时，每条都显示
                         print(f"{repo_name} {month}: 处理边 {idx}/{total_edges}...", flush=True)
                         logger.info(f"{repo_name} {month}: 处理边 {idx}/{total_edges}...")
                     elif idx % 10 == 0 or idx == 1:
-                        # 边数多时，每10条显示一次
                         print(f"{repo_name} {month}: 处理边 {idx}/{total_edges}...", flush=True)
                         logger.info(f"{repo_name} {month}: 处理边 {idx}/{total_edges}...")
                 
-                sentiment = self.sentiment_client.analyze_sentiment(comment_body)
-                sentiment_scores[edge_id] = sentiment
-                edges_processed += 1
-                    
-            except Exception as e:
-                edges_failed += 1
-                logger.warning(f"情感分析失败 (edge={edge_id}, {idx}/{total_edges}): {e}")
-                # 失败时使用中性值，确保分析可以继续
-                sentiment_scores[edge_id] = 0.0
+                try:
+                    result_edge_id, score, error = future.result()
+                    sentiment_scores[result_edge_id] = score
+                    if error is None:
+                        edges_processed += 1
+                    else:
+                        edges_failed += 1
+                        logger.warning(f"情感分析失败 (edge={result_edge_id}, {idx}/{total_edges}): {error}")
+                except Exception as e:
+                    edges_failed += 1
+                    sentiment_scores[edge_id] = 0.0
+                    logger.warning(f"情感分析失败 (edge={edge_id}, {idx}/{total_edges}): {e}")
         
         # 总结日志（总是显示）
         print(f"{repo_name} {month}: 情感分析完成 - 成功: {edges_processed}, 失败: {edges_failed}, 总计: {total_edges}", flush=True)
@@ -237,7 +256,7 @@ class CommunityAtmosphereAnalyzer:
         # 1. 情感传播分析
         print(f"  [1/3] 开始情感分析...", flush=True)
         logger.info(f"  [1/3] 开始情感分析...")
-        sentiment_scores = self.extract_sentiment_from_comments(discussion_graph, repo_name, month)
+        sentiment_scores = self.extract_sentiment_from_comments(discussion_graph, repo_name, month,15)
         if not sentiment_scores:
             # 检查是否是因为没有comment_body的边
             has_edges = discussion_graph.number_of_edges() > 0
@@ -368,49 +387,63 @@ class CommunityAtmosphereAnalyzer:
         # 2）社区紧密度（Clustering）
         # 3）网络效率（Network Efficiency：基于直径 + 平均路径长度）
         #
-        # 权重分配：
-        # - 情绪 40%
-        # - 聚类系数 30%
-        # - 网络效率 30%
+        # 权重分配（调整后）：
+        # - 情绪 20%（降低）：技术讨论多为中性，区分度有限
+        # - 聚类系数 40%（提高）：反映社区成员间的紧密协作关系，区分度高
+        # - 网络效率 40%（提高）：反映信息传播效率和社区连通性，区分度高
         # ------------------------------
         
-        # 1) 情绪：-1 ~ 1 线性映射到 0 ~ 1，再乘以 40 分
+        # 1) 情绪：-1 ~ 1 线性映射到 0 ~ 1，再乘以 20 分
         emotion_norm = max(0.0, min(1.0, (avg_emotion + 1.0) / 2.0))
-        emotion_score = emotion_norm * 40.0
+        emotion_score = emotion_norm * 20
         
-        # 2) 聚类系数：0 ~ 0.6 映射到 0 ~ 1，>0.6 视为满分
-        #   0.6 左右通常已经是非常紧密的网络
-        max_reasonable_clustering = 0.6
-        clustering_norm = 0.0
-        if max_reasonable_clustering > 0:
-            clustering_norm = max(0.0, min(1.0, avg_clustering / max_reasonable_clustering))
-        clustering_score = clustering_norm * 30.0
+        # 2) 聚类系数：使用平滑函数进行归一化，避免线性映射对低值过于严格
+        #   使用对数衰减函数，让低聚类系数也能得到合理分数
+        #   对于聚类系数：0 -> 0, 0.1 -> 0.33, 0.2 -> 0.5, 0.4 -> 0.75, 0.6 -> 1.0（平滑增长）
+        #   公式：1 / (1 + k * (threshold - clustering) / threshold)，其中 k 控制增长曲线
+        #   k=2.0 时：clustering=0 -> 0, clustering=0.1 -> 0.33, clustering=0.2 -> 0.5, clustering=0.4 -> 0.75, clustering=0.6 -> 1.0
+        clustering_threshold = 0.6
+        clustering_growth_factor = 2.0
+        if avg_clustering <= 0.0:
+            clustering_norm = 0.0
+        elif avg_clustering >= clustering_threshold:
+            clustering_norm = 1.0
+        else:
+            # 使用平滑增长函数，让低值也能得到合理分数
+            clustering_norm = 1.0 / (1.0 + clustering_growth_factor * (clustering_threshold - avg_clustering) / clustering_threshold)
+            # 确保最小值不会太小，至少保留 0.05（如果 clustering > 0）
+            if avg_clustering > 0.01:
+                clustering_norm = max(0.05, clustering_norm)
+        clustering_score = clustering_norm * 40
         
         # 3) 网络效率：直径/路径越小越好
-        #   假设常见直径在 [1, 6]，平均路径长度在 [1, 3.5] 范围内
-        max_diameter = 6.0
-        min_diameter = 1.0
-        max_apl = 3.5
-        min_apl = 1.0
+        #   使用对数/饱和函数进行归一化，避免硬截断，适应不同规模的项目
+        #   对于直径：1 -> 1.0, 6 -> 0.4, 10 -> 0.23, 20 -> 0.12（平滑衰减）
+        #   对于路径长度：1 -> 1.0, 3.5 -> 0.5, 5 -> 0.38, 8 -> 0.22（平滑衰减）
         
-        # 直径分量：在 [min_diameter, max_diameter] 内线性映射到 [1, 0]
-        if avg_diameter <= min_diameter:
+        # 直径分量：使用对数衰减函数，避免硬截断
+        # 公式：1 / (1 + k * (diameter - 1))，其中 k 控制衰减速度
+        # k=0.3 时：diameter=1 -> 1.0, diameter=6 -> 0.4, diameter=10 -> 0.23, diameter=20 -> 0.12
+        diameter_decay_factor = 0.3
+        if avg_diameter <= 1.0:
             diameter_component = 1.0
-        elif avg_diameter >= max_diameter:
-            diameter_component = 0.0
         else:
-            diameter_component = (max_diameter - avg_diameter) / (max_diameter - min_diameter)
+            diameter_component = 1.0 / (1.0 + diameter_decay_factor * (avg_diameter - 1.0))
+            # 确保不会完全为0，最小保留0.05
+            diameter_component = max(0.05, diameter_component)
         
-        # 路径长度分量：在 [min_apl, max_apl] 内线性映射到 [1, 0]
-        if avg_path_length <= min_apl:
+        # 路径长度分量：使用对数衰减函数，避免硬截断
+        # k=0.4 时：path_length=1 -> 1.0, path_length=3.5 -> 0.5, path_length=5 -> 0.38, path_length=8 -> 0.22
+        path_decay_factor = 0.4
+        if avg_path_length <= 1.0:
             path_component = 1.0
-        elif avg_path_length >= max_apl:
-            path_component = 0.0
         else:
-            path_component = (max_apl - avg_path_length) / (max_apl - min_apl)
+            path_component = 1.0 / (1.0 + path_decay_factor * (avg_path_length - 1.0))
+            # 确保不会完全为0，最小保留0.05
+            path_component = max(0.05, path_component)
         
         network_norm = 0.5 * diameter_component + 0.5 * path_component
-        network_score = network_norm * 30.0
+        network_score = network_norm * 40
         
         # 综合评分
         total_score = emotion_score + clustering_score + network_score
@@ -434,12 +467,12 @@ class CommunityAtmosphereAnalyzer:
                 "emotion": {
                     "value": round(avg_emotion, 3),
                     "score": round(emotion_score, 2),
-                    "weight": 40,
+                    "weight": 20,
                 },
                 "clustering": {
                     "value": round(avg_clustering, 3),
                     "score": round(clustering_score, 2),
-                    "weight": 30,
+                    "weight": 40,
                 },
                 "network_efficiency": {
                     "value": {
@@ -447,7 +480,7 @@ class CommunityAtmosphereAnalyzer:
                         "average_path_length": round(avg_path_length, 3),
                     },
                     "score": round(network_score, 2),
-                    "weight": 30,
+                    "weight": 40,
                 },
             },
         }

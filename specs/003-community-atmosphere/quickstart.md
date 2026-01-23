@@ -156,9 +156,14 @@ python -m src.analysis.community_atmosphere_analyzer \
   - `score`：综合评分，范围0-100，分数越高表示社区氛围越好
   - `level`：评分等级（excellent/good/moderate/poor）
   - `factors`：各因子得分和权重（当前版本仅保留三大类）：  
-    - `emotion`：情绪因子（权重40%），由时间平均的`average_emotion`经 [-1,1] → [0,1] 线性归一化得到；  
-    - `clustering`：社区紧密度因子（权重30%），基于时间平均的`average_local_clustering`，以 0.6 作为“非常紧密”的上限做归一化；  
-    - `network_efficiency`：网络效率因子（权重30%），综合时间平均的 `diameter` 和 `average_path_length`，分别在合理区间（直径约 1–6，平均路径约 1–3.5）内映射为 [0,1] 后取平均。
+  - `emotion`：情绪因子（权重20%），由时间平均的`average_emotion`经 [-1,1] → [0,1] 线性归一化得到；  
+  - `clustering`：社区紧密度因子（权重40%），基于时间平均的`average_local_clustering`，使用平滑增长函数进行归一化（避免线性映射对低值过于严格）：
+    - 公式：`clustering_norm = 1 / (1 + 2.0 × (0.6 - clustering) / 0.6)`
+    - 聚类系数 = 0 → 0.0, 0.1 → 0.33, 0.2 → 0.5, 0.4 → 0.75, ≥0.6 → 1.0  
+  - `network_efficiency`：网络效率因子（权重40%），综合时间平均的 `diameter` 和 `average_path_length`，使用对数衰减函数进行归一化（避免硬截断，适应不同规模项目）：
+    - 直径分量：`diameter_component = 1 / (1 + 0.3 × (diameter - 1))`，平滑衰减
+    - 路径长度分量：`path_component = 1 / (1 + 0.4 × (path_length - 1))`，平滑衰减
+    - 两者平均后乘以 40 得到网络效率得分
 
 ## 常见问题
 
