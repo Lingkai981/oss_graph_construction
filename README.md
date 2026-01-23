@@ -10,8 +10,9 @@
 ├─────────────────────────────────────────────────────────────────┤
 │  1. 数据采集        从 GitHub Archive 下载并过滤代表性项目数据    │
 │  2. 三类图构建      Actor-Actor / Actor-Repo / Actor-Discussion  │
-│  3. 倦怠分析        三层架构评分 + 多维度预警                     │
-│  4. 详细报告        按项目输出完整分析过程                        │
+│  3. 社区氛围分析    情感传播 + 聚类系数 + 网络直径                │
+│  4. 倦怠分析        三层架构评分 + 多维度预警                     │
+│  5. 详细报告        按项目输出完整分析过程                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -47,7 +48,254 @@ python -m src.analysis.monthly_graph_builder \
   --workers 4
 ```
 
-### 4. 运行倦怠分析
+### 4. 运行社区氛围分析
+
+```bash
+# 分析所有项目（使用整个时间序列）
+python -m src.analysis.community_atmosphere_analyzer \
+  --graphs-dir output/monthly-graphs/ \
+  --output-dir output/community-atmosphere-analysis/
+
+# 使用DeepSeek API进行情感分析（必需）
+# 在项目根目录创建.env文件，添加：DEEPSEEK_API_KEY=your_api_key_here
+python -m src.analysis.community_atmosphere_analyzer \
+  --graphs-dir output/monthly-graphs/ \
+  --output-dir output/community-atmosphere-analysis/
+```
+
+**社区氛围分析功能**：
+- **情感传播模型**：分析情绪如何在社区中传播（使用DeepSeek API进行情感分析）
+- **聚类系数**：衡量社区紧密度
+- **网络直径**：评估社区沟通效率
+- **时间序列分析**：自动处理整个时间序列，为每个项目生成月度指标时间序列
+- **综合评分**：基于时间序列指标计算社区氛围综合评分
+
+### 社区氛围分析原理与指标说明
+
+#### 整体分析流程
+
+- **输入数据**：
+  - `actor-discussion` 图：开发者与 Issue/PR 的参与关系，边上包含 `comment_body`（评论文本），用于情感分析与情感传播；
+  - `actor-actor` 图：开发者之间的协作关系网络，用于结构性指标（聚类系数、网络直径）计算；
+  - `output/monthly-graphs/index.json`：索引所有项目、图类型与月份对应的 `.graphml` 文件路径。
+- **逐项目、逐月份处理**：
+  - 对每个项目，找到既有 `actor-discussion` 又有 `actor-actor` 图的“可分析月份集合”；
+  - 对每一个可分析月份：
+    1. 读取 `actor-discussion` 图，抽取评论文本并调用 DeepSeek API 得到情感分数；
+    2. 在 `actor-discussion` 图上运行情感传播模型，得到本月的整体情绪氛围指标；
+    3. 读取同月的 `actor-actor` 图，计算聚类系数与网络直径等结构性指标；
+    4. 将本月的所有指标汇总为一条 `MonthlyAtmosphereMetrics` 记录。
+- **时间序列与综合评分**：
+  - 每完成一个月份的计算，就将该月份写入 `full_analysis.json`（支持断点续传）；
+  - 对同一项目的所有已完成月份，按时间序列汇总，计算“社区氛围综合评分 `atmosphere_score`”；
+  - 当某项目所有“可分析月份”都完成后，会把该项目的综合评分写入 `summary.json`，形成按分数排序的摘要列表。
+
+#### 算法一：情感分析与情感传播模型
+
+- **情感分数抽取（边级别）**：
+  - 对 `actor-discussion` 图中每条包含非空 `comment_body` 的边，调用 DeepSeek API 做情感分析；
+  - DeepSeek 返回的情绪分数被归一化到 \[-1, 1] 区间：
+    - 数值 **> 0**：偏正向，越大表示越积极；
+    - 数值 **< 0**：偏负向，绝对值越大表示越消极；
+    - 数值 **≈ 0**：情绪中性或不明显；
+  - 分数以 `edge_id -> score` 的形式缓存，用于后续传播（若调用失败则退化为 0.0，即中性）。
+
+- **节点初始情绪状态**：
+  - 对每条有情感分数的边，累计其源节点的情绪值：  
+    - `node_emotion[u] += sentiment_score(edge u→v)`；
+  - 对所有节点的初始情绪做一次归一化，避免某些高度活跃节点情绪值过大导致数值爆炸。
+
+- **PageRank 风格情感传播（迭代 `propagation_steps` 次）**：
+  - 在每一步中：
+    1. 遍历所有边，将源节点的情绪乘以该边的情感分数和阻尼系数 `damping_factor` 传播到目标节点；
+    2. 对每个节点，将“保留的旧情绪”和“新收到的情绪”按阻尼系数组合：
+       - 新情绪 = `damping_factor * old + (1 - damping_factor) * incoming`；
+  - 默认参数：
+    - `propagation_steps = 5`：限制传播轮数，避免无休止扩散；
+    - `damping_factor = 0.85`：类似 PageRank 的阻尼系数，控制情绪保持与更新的平衡。
+
+- **输出指标含义**：
+  - `average_emotion`：本月所有节点最终情绪值的平均数，范围约在 \[-1, 1]：
+    - 趋近 **1**：整体氛围非常积极，正向反馈居多；
+    - 约为 **0**：情绪总体中性或对冲；
+    - 趋近 **-1**：整体氛围偏消极，需要关注讨论中的负面情绪；
+  - `emotion_propagation_steps`：本次传播迭代步数（默认 5）；
+  - `emotion_damping_factor`：本次传播使用的阻尼系数（默认 0.85）。
+
+#### 算法二：聚类系数（社区紧密度）
+
+- **Actor 图准备（投影/去重）**：
+  - 若输入为 `actor-actor` 图：
+    - 直接将多重、有向边折叠为 **无向简单图**（去掉自环）；
+  - 若输入为 `actor-discussion` 图：
+    - 先构建一个 **投影图**：
+      - 若两个开发者共同参与同一个 Issue 或 PR，则在这两个 Actor 之间连一条无向边；
+      - 所有 Actor 节点都会被保留，即便暂时没有边。
+
+- **指标计算步骤**：
+  - **全局聚类系数 `global_clustering_coefficient`**：
+    - 采用 NetworkX 的 `transitivity`，衡量“闭合三角形（朋友的朋友也是朋友）”的比例；
+    - 取值 [0, 1]，越接近 1 说明开发者之间的连接越“成团”。
+  - **局部聚类系数与平均局部聚类系数**：
+    - 对每个节点计算“邻居之间实际连边数 / 邻居之间可能的最大连边数”；
+    - 将所有节点的局部聚类系数取平均，得到 `average_local_clustering`；
+    - 该值 [0, 1] 越大，说明“典型开发者周围的小团体越紧密”。
+  - 同时记录：
+    - `actor_graph_nodes`：Actor 图节点数（参与社区互动的开发者规模）；
+    - `actor_graph_edges`：Actor 图边数（协作关系数量）。
+
+- **解释建议**：
+  - `global_clustering_coefficient` 高 & `average_local_clustering` 高：
+    - 社区具有明显的“小团体”结构，核心成员之间互相高度连通；
+  - 两者都接近 0：
+    - 说明协作关系稀疏，开发者之间协同较少，互动多为点对点、一次性。
+
+#### 算法三：网络直径（沟通效率）
+
+- **Actor 图准备**：
+  - 与聚类系数相同，统一在“无向简单 Actor 图”上计算；
+  - 若原图非连通，会挑出**最大连通分量**作为代表。
+
+- **核心步骤**：
+  - **连通性检查**：
+    - `is_connected`：图是否整体连通；
+    - `num_connected_components`：连通分量数量；
+    - `largest_component_size`：最大连通分量的节点数。
+  - **若图连通**：
+    - `diameter`：所有节点对之间最短路径的最大值，表示“最远两点之间需要经过多少步”；
+    - `average_path_length`：所有节点对之间最短路径长度的平均值，表示“典型两点之间的平均距离”。
+  - **若图不连通**：
+    - 在最大连通分量子图上计算 `diameter` 和 `average_path_length`，其他孤立点不参与；
+  - 直观上：
+    - `diameter` 越小：说明最远的两个人之间“中间需要转手的人”更少，结构更紧凑；
+    - `average_path_length` 越小：说明信息在典型两点之间传播所需的“跳数”更少，沟通更高效。
+
+#### 综合评分：社区氛围得分 `atmosphere_score`
+
+- **时间序列聚合**：
+  - 对某项目所有月份的 `MonthlyAtmosphereMetrics`：
+    - 计算时间维度上的平均值：
+      - `avg_emotion`：平均情绪；
+      - `avg_clustering`：平均局部聚类系数；
+      - `avg_diameter`：平均网络直径；
+      - `avg_path_length`：平均路径长度。
+
+- **三大因子与权重**：
+  - **情绪因子（Emotion，40 分）**：
+    - 把 [-1, 1] 的 `avg_emotion` 线性映射到 [0, 1] 再乘以 40：
+      - `emotion_norm = (avg_emotion + 1) / 2`（截断到 [0,1]）；
+      - `emotion_score = emotion_norm * 40`；
+    - 情绪越正向、越稳定，得分越高。
+  - **社区紧密度因子（Clustering，30 分）**：
+    - 将 `avg_clustering` 以 0.6 作为“非常紧密”的上限做归一化：
+      - `clustering_norm = min(1, avg_clustering / 0.6)`；
+      - `clustering_score = clustering_norm * 30`；
+    - 当社区局部聚类系数长期处于 0.6 以上时，视为满分。
+  - **网络效率因子（Network Efficiency，30 分）**：
+    - 预设“合理范围”：
+      - 直径 `avg_diameter` 约落在 [1, 6]；
+      - 平均路径 `avg_path_length` 约落在 [1, 3.5]；
+    - 在各自区间内将“越小越好”映射到 [0,1]：
+      - 直径分量：`diameter_component`，从 1（非常紧凑）到 0（非常松散）；
+      - 路径分量：`path_component`，从 1（平均路径最短）到 0（平均路径很长）；
+    - 再取两者平均得到 `network_norm`，乘以 30 得到 `network_score`。
+
+- **总分与等级**：
+  - 总分范围 [0, 100]：  
+    - `total_score = emotion_score + clustering_score + network_score`；
+  - 等级划分（用于 `summary.json` 中的 `level` 字段）：
+    - `excellent`：`total_score ≥ 80`，社区氛围非常健康；
+    - `good`：`60 ≤ total_score < 80`，整体良好，局部可优化；
+    - `moderate`：`40 ≤ total_score < 60`，一般，需要关注局部问题；
+    - `poor`：`total_score < 40`，整体氛围偏弱或存在明显问题。
+
+#### 结果文件与示例
+
+- **full_analysis.json（按项目聚合的完整结果）**：
+  - 结构（示意）：
+  
+```json
+{
+  "mochajs/mocha": {
+    "metrics": [
+      {
+        "month": "2023-05",
+        "repo_name": "mochajs/mocha",
+        "average_emotion": -0.0308128689236111,
+        "emotion_propagation_steps": 5,
+        "emotion_damping_factor": 0.85,
+        "global_clustering_coefficient": 0.0,
+        "average_local_clustering": 0.0,
+        "actor_graph_nodes": 2,
+        "actor_graph_edges": 1,
+        "diameter": 1,
+        "average_path_length": 1.0,
+        "is_connected": true,
+        "num_connected_components": 1,
+        "largest_component_size": 2
+      }
+      // ... 其他月份 ...
+    ],
+    "atmosphere_score": {
+      "score": 50.03,
+      "level": "moderate",
+      "months_analyzed": 25,
+      "period": "2023-05 to 2025-12",
+      "factors": {
+        "emotion": {
+          "value": 0.055,
+          "score": 21.1,
+          "weight": 40
+        },
+        "clustering": {
+          "value": 0.047,
+          "score": 1.42,
+          "weight": 30
+        },
+        "diameter": {
+          "value": 1.36,
+          "score": 18.64,
+          "weight": 20
+        },
+        "path_length": {
+          "value": 1.136,
+          "score": 8.86,
+          "weight": 10
+        }
+      }
+    }
+  }
+}
+```
+
+- **summary.json（只包含“全部月份已分析完”的项目）**：
+
+```json
+[
+  {
+    "repo_name": "mochajs/mocha",
+    "atmosphere_score": 50.03,
+    "level": "moderate",
+    "months_analyzed": 25
+  },
+  {
+    "repo_name": "automatic1111/stable-diffusion-webui",
+    "atmosphere_score": 49.02,
+    "level": "moderate",
+    "months_analyzed": 32
+  },
+  {
+    "repo_name": "vercel/next.js",
+    "atmosphere_score": 44.63,
+    "level": "moderate",
+    "months_analyzed": 37
+  }
+]
+```
+
+你可以通过直接查看 `output/community-atmosphere-analysis/full_analysis.json` 与 `summary.json`，来进一步探索各项目在不同月份的具体社区氛围变化趋势与结构特征。
+
+### 5. 运行倦怠分析
 
 ```bash
 python -m src.analysis.burnout_analyzer \
