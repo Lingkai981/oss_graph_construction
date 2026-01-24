@@ -170,19 +170,55 @@ def group_by_month_and_repo(
 
 # ==================== 图构建函数 ====================
 
-def _escape_xml_text(text: str) -> str:
-    """转义 XML 特殊字符"""
+def _clean_text_for_xml(text: str) -> str:
+    """
+    清理文本中的控制字符，使其可以作为 XML 文本安全写入
+    
+    移除 XML 1.0 不允许的控制字符（除了 \t \n \r），保留其他所有字符。
+    NetworkX/ElementTree 会自动处理 XML 转义（& < > " '），所以这里只清理控制字符。
+    
+    适用于所有文本字段：login, name, title, creator_login 等
+    """
     if not text:
         return ""
-    return (text
+    
+    # 过滤 XML 不允许的控制字符（与 _sanitize_comment_text 使用相同的逻辑）
+    return "".join(
+        ch
+        for ch in text
+        if (
+            ch == "\t"
+            or ch == "\n"
+            or ch == "\r"
+            or 0x20 <= ord(ch) <= 0xD7FF
+            or 0xE000 <= ord(ch) <= 0xFFFD
+        )
+    )
+
+
+def _escape_xml_text(text: str) -> str:
+    """
+    转义 XML 特殊字符并清理控制字符
+    
+    先清理 XML 不允许的控制字符（除了 \t \n \r），再进行 XML 转义，
+    确保生成的 XML 文件格式正确。与 _sanitize_comment_text 使用相同的控制字符过滤逻辑。
+    
+    注意：此函数会转义 XML 特殊字符，适用于需要手动转义的场景。
+    对于 NetworkX 写入的字段，使用 _clean_text_for_xml 即可（NetworkX 会自动转义）。
+    """
+    if not text:
+        return ""
+    
+    # 先清理控制字符
+    cleaned = _clean_text_for_xml(text)
+    
+    # 然后转义 XML 特殊字符
+    return (cleaned
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;")
             .replace("'", "&apos;")
-            .replace("\x00", "")  # 移除空字符
-            .replace("\x0b", "")  # 移除垂直制表符
-            .replace("\x0c", "")  # 移除换页符
             )
 
 
@@ -245,7 +281,7 @@ def build_actor_actor_graph(
         if actor_id not in actors:
             actors[actor_id] = ActorStats(
                 actor_id=actor_id,
-                login=actor_data.get("login") or "",
+                login=_clean_text_for_xml(actor_data.get("login") or ""),
             )
         return actor_id
     
@@ -426,7 +462,7 @@ def build_actor_repo_graph(
         if actor_id not in actors:
             actors[actor_id] = ActorStats(
                 actor_id=actor_id,
-                login=actor.get("login") or "",
+                login=_clean_text_for_xml(actor.get("login") or ""),
             )
         actors[actor_id].event_count += 1
         actors[actor_id].event_types[event_type] = \
@@ -436,7 +472,7 @@ def build_actor_repo_graph(
         if repo_id not in repos:
             repos[repo_id] = RepoStats(
                 repo_id=repo_id,
-                name=repo.get("name") or "",
+                name=_clean_text_for_xml(repo.get("name") or ""),
             )
         repos[repo_id].event_count += 1
         repos[repo_id].event_types[event_type] = \
@@ -520,7 +556,7 @@ def build_actor_discussion_graph(
         if actor_id not in actors:
             actors[actor_id] = ActorStats(
                 actor_id=actor_id,
-                login=actor_data.get("login") or "",
+                login=_clean_text_for_xml(actor_data.get("login") or ""),
             )
         return actor_id
     
@@ -560,10 +596,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="Issue",
                         number=issue_number,
-                        title=_escape_xml_text(issue.get("title") or ""),
+                        title=_clean_text_for_xml(issue.get("title") or ""),
                         state=issue.get("state") or "",
                         creator_id=issue_user.get("id"),
-                        creator_login=issue_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(issue_user.get("login") or ""),
                         created_at=issue.get("created_at"),
                     )
                 
@@ -591,10 +627,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="Issue",
                         number=issue_number,
-                        title=_escape_xml_text(issue.get("title") or ""),
+                        title=_clean_text_for_xml(issue.get("title") or ""),
                         state=issue.get("state") or "",
                         creator_id=issue_user.get("id"),
-                        creator_login=issue_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(issue_user.get("login") or ""),
                         created_at=issue.get("created_at"),
                     )
                 
@@ -633,10 +669,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="PullRequest",
                         number=pr_number,
-                        title=_escape_xml_text(pr.get("title") or ""),
+                        title=_clean_text_for_xml(pr.get("title") or ""),
                         state=pr.get("state") or "",
                         creator_id=pr_user.get("id"),
-                        creator_login=pr_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(pr_user.get("login") or ""),
                         created_at=pr.get("created_at"),
                     )
                 
@@ -672,10 +708,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="PullRequest",
                         number=pr_number,
-                        title=_escape_xml_text(pr.get("title") or ""),
+                        title=_clean_text_for_xml(pr.get("title") or ""),
                         state=pr.get("state") or "",
                         creator_id=pr_user.get("id"),
-                        creator_login=pr_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(pr_user.get("login") or ""),
                         created_at=pr.get("created_at"),
                     )
                 

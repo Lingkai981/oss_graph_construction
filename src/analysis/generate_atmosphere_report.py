@@ -1,206 +1,369 @@
 """
-社区氛围分析报告生成器
+详细社区氛围分析报告生成器
 
-根据 full_analysis.json 和 summary.json 生成详细的社区氛围分析报告。
-类似倦怠者分析报告，包含概述、项目对比、指标分析和建议。
+按项目输出每一项得分的来源和数值变化
 """
 
 import json
+import argparse
+import sys
+import io
 from pathlib import Path
 from typing import Dict, Any, List
-import matplotlib.pyplot as plt
-import pandas as pd
+from datetime import datetime
 
-class AtmosphereReportGenerator:
-    """社区氛围分析报告生成器"""
+# 修复 Windows 控制台编码问题
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-    def __init__(self, full_analysis_path: str, summary_path: str, output_path: str):
-        self.full_analysis_path = Path(full_analysis_path)
-        self.summary_path = Path(summary_path)
-        self.output_path = Path(output_path)
-        self.full_data: Dict[str, Any] = {}
-        self.summary_data: List[Dict[str, Any]] = []
 
-    def load_data(self):
-        """加载分析数据"""
-        try:
-            with open(self.full_analysis_path, 'r', encoding='utf-8') as f:
-                self.full_data = json.load(f)
-            with open(self.summary_path, 'r', encoding='utf-8') as f:
-                self.summary_data = json.load(f)
-            print(f"数据加载成功: {len(self.full_data)} 个项目的详细数据, {len(self.summary_data)} 个项目摘要")
-        except Exception as e:
-            print(f"数据加载失败: {e}")
-            return False
-        return True
+def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
+    """生成单个仓库的详细报告"""
+    lines = []
+    lines.append("=" * 80)
+    lines.append(f"📊 项目: {repo_name}")
+    lines.append("=" * 80)
+    
+    # 获取氛围评分
+    atmosphere = repo_data.get("atmosphere_score", {})
+    score = atmosphere.get("score", 0)
+    level = atmosphere.get("level", "unknown")
+    period = atmosphere.get("period", "N/A")
+    months = atmosphere.get("months_analyzed", 0)
+    
+    # 氛围等级图标
+    level_icons = {
+        "excellent": "🟢 优秀",
+        "good": "🟢 良好",
+        "moderate": "🟡 中等",
+        "poor": "🔴 较差",
+        "unknown": "⚪ 未知"
+    }
+    
+    lines.append(f"\n🎯 综合氛围评分: {score:.2f} / 100")
+    lines.append(f"   氛围等级: {level_icons.get(level, level)}")
+    lines.append(f"   分析周期: {period} ({months} 个月)")
+    
+    # 获取指标时间序列
+    metrics = repo_data.get("metrics", [])
+    if len(metrics) < 2:
+        lines.append("\n⚠️ 数据不足，无法进行趋势分析")
+        return "\n".join(lines)
+    
+    # 按月份排序
+    sorted_metrics = sorted(metrics, key=lambda m: m.get("month", ""))
+    earliest = sorted_metrics[0]
+    latest = sorted_metrics[-1]
+    
+    lines.append("\n" + "-" * 80)
+    lines.append("📈 各因子详细分析（三大因子：情绪氛围20% + 社区紧密度40% + 网络效率40%）")
+    lines.append("-" * 80)
+    
+    factors = atmosphere.get("factors", {})
+    
+    # 1. 情绪氛围因子
+    lines.append("\n【1. 情绪氛围因子】(0-20分，权重20%)")
+    emotion = factors.get("emotion", {})
+    emotion_value = emotion.get("value", 0)
+    emotion_score = emotion.get("score", 0)
+    
+    early_emotion = earliest.get("average_emotion", 0)
+    late_emotion = latest.get("average_emotion", 0)
+    
+    lines.append(f"   📊 数据概览:")
+    lines.append(f"      首月平均情绪: {early_emotion:+.3f}  →  末月平均情绪: {late_emotion:+.3f}")
+    lines.append(f"      整体平均情绪: {emotion_value:+.3f} (范围: -1.0 到 +1.0)")
+    
+    # 计算趋势
+    emotion_values = [m.get("average_emotion", 0) for m in sorted_metrics]
+    if len(emotion_values) >= 3:
+        early_avg = sum(emotion_values[:3]) / min(3, len(emotion_values))
+        recent_avg = sum(emotion_values[-3:]) / min(3, len(emotion_values))
+        change = recent_avg - early_avg
+        lines.append(f"      早期3月均值: {early_avg:+.3f}  →  近期3月均值: {recent_avg:+.3f}")
+        if change > 0:
+            lines.append(f"      ✅ 情绪趋势向好 (提升 {change:+.3f})")
+        elif change < 0:
+            lines.append(f"      ⚠️ 情绪趋势下降 (下降 {abs(change):.3f})")
+        else:
+            lines.append(f"      ➡️ 情绪保持稳定")
+    
+    lines.append(f"   ➡️ 因子得分: {emotion_score:.2f} / 20")
+    lines.append(f"      (归一化公式: (avg_emotion + 1.0) / 2.0 * 20)")
+    
+    # 2. 社区紧密度因子（聚类系数）
+    lines.append("\n【2. 社区紧密度因子】(0-40分，权重40%)")
+    clustering = factors.get("clustering", {})
+    clustering_value = clustering.get("value", 0)
+    clustering_score = clustering.get("score", 0)
+    
+    early_clustering = earliest.get("average_local_clustering", 0)
+    late_clustering = latest.get("average_local_clustering", 0)
+    
+    lines.append(f"   📊 数据概览:")
+    lines.append(f"      首月平均聚类系数: {early_clustering:.3f}  →  末月平均聚类系数: {late_clustering:.3f}")
+    lines.append(f"      整体平均聚类系数: {clustering_value:.3f} (范围: 0.0 到 1.0)")
+    
+    # 计算趋势
+    clustering_values = [m.get("average_local_clustering", 0) for m in sorted_metrics]
+    if len(clustering_values) >= 3:
+        early_avg = sum(clustering_values[:3]) / min(3, len(clustering_values))
+        recent_avg = sum(clustering_values[-3:]) / min(3, len(clustering_values))
+        change = recent_avg - early_avg
+        lines.append(f"      早期3月均值: {early_avg:.3f}  →  近期3月均值: {recent_avg:.3f}")
+        if change > 0.01:
+            lines.append(f"      ✅ 紧密度提升 (提升 {change:+.3f})")
+        elif change < -0.01:
+            lines.append(f"      ⚠️ 紧密度下降 (下降 {abs(change):+.3f})")
+        else:
+            lines.append(f"      ➡️ 紧密度保持稳定")
+    
+    # 解释归一化逻辑
+    clustering_threshold = 0.6
+    clustering_growth_factor = 2.0
+    if clustering_value <= 0.0:
+        norm_explanation = "0.0 (聚类系数为0)"
+    elif clustering_value >= clustering_threshold:
+        norm_explanation = "1.0 (达到阈值0.6)"
+    else:
+        norm_explanation = f"{1.0 / (1.0 + clustering_growth_factor * (clustering_threshold - clustering_value) / clustering_threshold):.3f} (平滑增长函数)"
+    
+    lines.append(f"   ➡️ 因子得分: {clustering_score:.2f} / 40")
+    lines.append(f"      (归一化值: {norm_explanation})")
+    lines.append(f"      (归一化公式: 平滑增长函数，阈值={clustering_threshold}, 增长因子={clustering_growth_factor})")
+    
+    # 3. 网络效率因子
+    lines.append("\n【3. 网络效率因子】(0-40分，权重40%)")
+    network = factors.get("network_efficiency", {})
+    network_value = network.get("value", {})
+    network_score = network.get("score", 0)
+    
+    avg_diameter = network_value.get("average_diameter", 0)
+    avg_path_length = network_value.get("average_path_length", 0)
+    
+    early_diameter = earliest.get("diameter", 0)
+    late_diameter = latest.get("diameter", 0)
+    early_path = earliest.get("average_path_length", 0)
+    late_path = latest.get("average_path_length", 0)
+    
+    lines.append(f"   📊 数据概览:")
+    lines.append(f"      首月网络直径: {early_diameter:.1f}  →  末月网络直径: {late_diameter:.1f}")
+    lines.append(f"      首月平均路径长度: {early_path:.2f}  →  末月平均路径长度: {late_path:.2f}")
+    lines.append(f"      整体平均直径: {avg_diameter:.3f}")
+    lines.append(f"      整体平均路径长度: {avg_path_length:.3f}")
+    
+    # 计算趋势
+    diameter_values = [m.get("diameter", 0) for m in sorted_metrics]
+    path_values = [m.get("average_path_length", 0) for m in sorted_metrics]
+    
+    if len(diameter_values) >= 3:
+        early_dia_avg = sum(diameter_values[:3]) / min(3, len(diameter_values))
+        recent_dia_avg = sum(diameter_values[-3:]) / min(3, len(diameter_values))
+        change_dia = recent_dia_avg - early_dia_avg
+        
+        early_path_avg = sum(path_values[:3]) / min(3, len(path_values))
+        recent_path_avg = sum(path_values[-3:]) / min(3, len(path_values))
+        change_path = recent_path_avg - early_path_avg
+        
+        lines.append(f"      早期3月平均直径: {early_dia_avg:.2f}  →  近期3月平均直径: {recent_dia_avg:.2f}")
+        if change_dia < -0.1:
+            lines.append(f"      ✅ 直径减小，效率提升 (减少 {abs(change_dia):.2f})")
+        elif change_dia > 0.1:
+            lines.append(f"      ⚠️ 直径增大，效率下降 (增加 {change_dia:.2f})")
+        else:
+            lines.append(f"      ➡️ 直径保持稳定")
+        
+        lines.append(f"      早期3月平均路径: {early_path_avg:.2f}  →  近期3月平均路径: {recent_path_avg:.2f}")
+        if change_path < -0.1:
+            lines.append(f"      ✅ 路径缩短，效率提升 (减少 {abs(change_path):.2f})")
+        elif change_path > 0.1:
+            lines.append(f"      ⚠️ 路径增长，效率下降 (增加 {change_path:.2f})")
+        else:
+            lines.append(f"      ➡️ 路径保持稳定")
+    
+    # 解释归一化逻辑
+    diameter_decay_factor = 0.3
+    path_decay_factor = 0.4
+    
+    if avg_diameter <= 1.0:
+        dia_norm = 1.0
+        dia_explanation = "1.0 (直径≤1，最优)"
+    else:
+        dia_norm = 1.0 / (1.0 + diameter_decay_factor * (avg_diameter - 1.0))
+        dia_norm = max(0.05, dia_norm)
+        dia_explanation = f"{dia_norm:.3f} (对数衰减，衰减因子={diameter_decay_factor})"
+    
+    if avg_path_length <= 1.0:
+        path_norm = 1.0
+        path_explanation = "1.0 (路径≤1，最优)"
+    else:
+        path_norm = 1.0 / (1.0 + path_decay_factor * (avg_path_length - 1.0))
+        path_norm = max(0.05, path_norm)
+        path_explanation = f"{path_norm:.3f} (对数衰减，衰减因子={path_decay_factor})"
+    
+    network_norm = 0.5 * dia_norm + 0.5 * path_norm
+    
+    lines.append(f"   ➡️ 因子得分: {network_score:.2f} / 40")
+    lines.append(f"      直径归一化: {dia_explanation}")
+    lines.append(f"      路径归一化: {path_explanation}")
+    lines.append(f"      综合归一化: {network_norm:.3f} (直径50% + 路径50%)")
+    lines.append(f"      (归一化公式: 对数衰减函数，避免硬截断)")
+    
+    # 汇总
+    lines.append("\n" + "-" * 80)
+    lines.append("📋 评分汇总")
+    lines.append("-" * 80)
+    
+    emotion_score = factors.get("emotion", {}).get("score", 0)
+    clustering_score = factors.get("clustering", {}).get("score", 0)
+    network_score = factors.get("network_efficiency", {}).get("score", 0)
+    
+    lines.append(f"   情绪氛围因子:     {emotion_score:6.2f} / 20  (权重20%)")
+    lines.append(f"   社区紧密度因子:    {clustering_score:6.2f} / 40  (权重40%)")
+    lines.append(f"   网络效率因子:      {network_score:6.2f} / 40  (权重40%)")
+    lines.append(f"   " + "-" * 30)
+    lines.append(f"   总分:              {score:6.2f} / 100")
+    
+    # 月度趋势
+    lines.append("\n" + "-" * 80)
+    lines.append("📅 月度指标趋势")
+    lines.append("-" * 80)
+    lines.append(f"   {'月份':<10} {'情绪':>8} {'聚类系数':>10} {'直径':>8} {'路径长度':>10} {'节点数':>8} {'边数':>8}")
+    lines.append("   " + "-" * 70)
+    
+    for m in sorted_metrics:
+        month = m.get("month", "N/A")
+        emotion = m.get("average_emotion", 0)
+        clustering = m.get("average_local_clustering", 0)
+        diameter = m.get("diameter", 0)
+        path_length = m.get("average_path_length", 0)
+        nodes = m.get("actor_graph_nodes", 0)
+        edges = m.get("actor_graph_edges", 0)
+        lines.append(f"   {month:<10} {emotion:>+8.3f} {clustering:>10.3f} {diameter:>8.1f} {path_length:>10.2f} {nodes:>8} {edges:>8}")
+    
+    lines.append("")
+    return "\n".join(lines)
 
-    def generate_report(self) -> str:
-        """生成 Markdown 格式的报告"""
-        if not self.full_data or not self.summary_data:
-            return "# 社区氛围分析报告\n\n数据加载失败，无法生成报告。"
-
-        report = []
-
-        # 标题
-        report.append("# 社区氛围分析报告")
-        report.append("")
-        report.append("## 概述")
-        report.append("")
-        report.append("本报告基于社区氛围分析系统生成，评估开源项目的社区健康度。")
-        report.append("分析指标包括情绪传播、聚类系数、网络直径等，综合评分范围 0-100。")
-        report.append("")
-
-        # 整体统计
-        total_projects = len(self.summary_data)
-        avg_score = sum(p['atmosphere_score'] for p in self.summary_data) / total_projects
-        levels = [p['level'] for p in self.summary_data]
-        level_counts = {level: levels.count(level) for level in set(levels)}
-
-        report.append("### 整体统计")
-        report.append(f"- 分析项目数: {total_projects}")
-        report.append(f"- 平均综合评分: {avg_score:.2f}")
-        report.append(f"- 评分等级分布: {level_counts}")
-        report.append("")
-
-        # 项目排名
-        report.append("### 项目综合评分排名")
-        report.append("")
-        sorted_projects = sorted(self.summary_data, key=lambda x: x['atmosphere_score'], reverse=True)
-        for i, project in enumerate(sorted_projects, 1):
-            report.append(f"{i}. **{project['repo_name']}**: {project['atmosphere_score']:.2f} ({project['level']}, {project['months_analyzed']} 个月)")
-        report.append("")
-
-        # 详细项目分析
-        report.append("## 详细项目分析")
-        report.append("")
-
-        for project in sorted_projects:
-            repo_name = project['repo_name']
-            if repo_name not in self.full_data:
-                continue
-
-            repo_data = self.full_data[repo_name]
-            if not isinstance(repo_data, list):
-                print(f"警告: {repo_name} 的数据格式错误，跳过")
-                continue
-
-            report.append(f"### {repo_name}")
-            report.append("")
-            report.append(f"- **综合评分**: {project['atmosphere_score']:.2f} ({project['level']})")
-            report.append(f"- **分析月份**: {project['months_analyzed']}")
-            report.append("")
-
-            # 情绪分析
-            emotions = [month['average_emotion'] for month in repo_data if 'average_emotion' in month]
-            if emotions:
-                avg_emotion = sum(emotions) / len(emotions)
-                min_emotion = min(emotions)
-                max_emotion = max(emotions)
-                report.append("#### 情绪分析")
-                report.append(f"- 平均情绪: {avg_emotion:.3f} (范围: {min_emotion:.3f} 到 {max_emotion:.3f})")
-                report.append(f"- 情绪趋势: {'稳定' if max_emotion - min_emotion < 0.1 else '波动较大'}")
-                report.append("")
-
-            # 结构分析
-            clustering = [month.get('global_clustering_coefficient', 0) for month in repo_data]
-            diameters = [month.get('diameter', 0) for month in repo_data]
-            path_lengths = [month.get('average_path_length', 0) for month in repo_data]
-
-            if clustering:
-                avg_clustering = sum(clustering) / len(clustering)
-                report.append("#### 结构分析")
-                report.append(f"- 平均聚类系数: {avg_clustering:.3f} ({'紧密' if avg_clustering > 0.3 else '松散'})")
-                report.append(f"- 平均网络直径: {sum(diameters)/len(diameters):.1f}")
-                report.append(f"- 平均路径长度: {sum(path_lengths)/len(path_lengths):.2f}")
-                report.append("")
-
-            # 月度趋势
-            report.append("#### 月度趋势")
-            report.append("")
-            report.append("| 月份 | 情绪 | 聚类系数 | 直径 | 路径长度 |")
-            report.append("|------|------|----------|------|----------|")
-            for month in repo_data[-5:]:  # 最近5个月
-                month_name = month.get('month', '未知')
-                emotion = month.get('average_emotion', 0)
-                clustering = month.get('global_clustering_coefficient', 0)
-                diameter = month.get('diameter', 0)
-                path_length = month.get('average_path_length', 0)
-                report.append(f"| {month_name} | {emotion:.3f} | {clustering:.3f} | {diameter} | {path_length:.2f} |")
-            report.append("")
-
-        # 指标解释
-        report.append("## 指标解释")
-        report.append("")
-        report.append("### 情绪分析")
-        report.append("- **average_emotion**: 社区平均情绪值 (-1 到 1)，越高表示越正面。")
-        report.append("- **传播模型**: 使用 PageRank-like 算法模拟情绪在社区中的传播。")
-        report.append("")
-        report.append("### 结构分析")
-        report.append("- **global_clustering_coefficient**: 全局聚类系数 (0-1)，衡量社区紧密程度。")
-        report.append("- **diameter**: 网络直径，衡量沟通效率（越小越好）。")
-        report.append("- **average_path_length**: 平均最短路径长度，反映信息传播速度。")
-        report.append("")
-        report.append("### 综合评分")
-        report.append("- 基于情绪 (40%)、聚类 (30%)、直径 (20%)、路径长度 (10%) 加权计算。")
-        report.append("- 等级: excellent (≥80), good (≥60), moderate (≥40), poor (<40)。")
-        report.append("")
-
-        # 建议
-        report.append("## 建议")
-        report.append("")
-        report.append("### 提升社区氛围")
-        report.append("- **增加互动**: 鼓励更多正面讨论，提升情绪得分。")
-        report.append("- **加强连接**: 组织活动或小组，促进聚类系数提升。")
-        report.append("- **优化沟通**: 减少信息孤岛，降低网络直径。")
-        report.append("")
-        report.append("### 系统改进")
-        report.append("- 优化情绪分析提示词，提高区分度。")
-        report.append("- 添加更多指标，如活跃度和多样性。")
-        report.append("- 定期监控月度趋势，及时干预。")
-        report.append("")
-
-        return "\n".join(report)
-
-    def save_report(self, report_content: str):
-        """保存报告到文件"""
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.output_path, 'w', encoding='utf-8') as f:
-            f.write(report_content)
-        print(f"报告已保存到: {self.output_path}")
-
-    def generate_chart(self):
-        """生成简单图表（可选）"""
-        if not self.summary_data:
-            return
-
-        # 评分柱状图
-        repos = [p['repo_name'] for p in self.summary_data]
-        scores = [p['atmosphere_score'] for p in self.summary_data]
-
-        plt.figure(figsize=(10, 6))
-        plt.bar(repos, scores, color='skyblue')
-        plt.title('项目综合评分对比')
-        plt.xlabel('项目')
-        plt.ylabel('评分')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(self.output_path.parent / 'atmosphere_scores.png')
-        plt.close()
-        print("图表已保存: atmosphere_scores.png")
 
 def main():
-    """主函数"""
-    generator = AtmosphereReportGenerator(
-        full_analysis_path="output/community-atmosphere-analysis/full_analysis.json",
-        summary_path="output/community-atmosphere-analysis/summary.json",
-        output_path="output/community-atmosphere-analysis/atmosphere_report.md"
+    parser = argparse.ArgumentParser(description="生成详细社区氛围分析报告")
+    parser.add_argument(
+        "--input",
+        type=str,
+        default="output/community-atmosphere-analysis/full_analysis.json",
+        help="输入的完整分析文件路径"
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="output/community-atmosphere-analysis/detailed_report.txt",
+        help="输出报告文件路径"
+    )
+    parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="只分析指定的仓库（可用逗号分隔多个）"
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=None,
+        help="只输出氛围评分最高的前 N 个项目"
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=None,
+        help="只输出氛围评分大于等于该值的项目"
+    )
+    parser.add_argument(
+        "--max-score",
+        type=float,
+        default=None,
+        help="只输出氛围评分小于等于该值的项目"
+    )
+    
+    args = parser.parse_args()
+    
+    # 读取分析数据
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"❌ 文件不存在: {input_path}")
+        return
+    
+    print(f"📖 读取分析数据: {input_path}")
+    with open(input_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    # 筛选仓库
+    repos_to_analyze = list(data.keys())
+    
+    if args.repo:
+        specified_repos = [r.strip() for r in args.repo.split(",")]
+        repos_to_analyze = [r for r in repos_to_analyze if r in specified_repos]
+        if not repos_to_analyze:
+            print(f"❌ 未找到指定的仓库: {args.repo}")
+            return
+    
+    # 按氛围评分排序
+    repos_with_scores = []
+    for repo in repos_to_analyze:
+        score = data[repo].get("atmosphere_score", {}).get("score", 0)
+        repos_with_scores.append((repo, score))
+    
+    repos_with_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    # 筛选条件
+    if args.min_score is not None:
+        repos_with_scores = [(r, s) for r, s in repos_with_scores if s >= args.min_score]
+    
+    if args.max_score is not None:
+        repos_with_scores = [(r, s) for r, s in repos_with_scores if s <= args.max_score]
+    
+    if args.top is not None:
+        repos_with_scores = repos_with_scores[:args.top]
+    
+    if not repos_with_scores:
+        print("❌ 没有符合条件的项目")
+        return
+    
+    print(f"📊 将分析 {len(repos_with_scores)} 个项目")
+    
+    # 生成报告
+    reports = []
+    reports.append("=" * 80)
+    reports.append("🔍 OSS 项目社区氛围详细分析报告")
+    reports.append("=" * 80)
+    reports.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    reports.append(f"分析项目数: {len(repos_with_scores)}")
+    reports.append("")
+    
+    for repo, score in repos_with_scores:
+        report = generate_repo_report(repo, data[repo])
+        reports.append(report)
+    
+    full_report = "\n".join(reports)
+    
+    # 输出到文件
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(full_report)
+    
+    print(f"✅ 报告已保存: {output_path}")
+    
+    # 同时输出到控制台（如果项目数少于等于3）
+    if len(repos_with_scores) <= 3:
+        print("\n" + full_report)
+    else:
+        # 只输出前3个
+        print("\n📋 前 3 个项目预览:\n")
+        for repo, score in repos_with_scores[:3]:
+            print(generate_repo_report(repo, data[repo]))
 
-    if generator.load_data():
-        report = generator.generate_report()
-        generator.save_report(report)
-        generator.generate_chart()
-        print("社区氛围分析报告生成完成！")
 
 if __name__ == "__main__":
     main()

@@ -256,7 +256,7 @@ class CommunityAtmosphereAnalyzer:
         # 1. 情感传播分析
         print(f"  [1/3] 开始情感分析...", flush=True)
         logger.info(f"  [1/3] 开始情感分析...")
-        sentiment_scores = self.extract_sentiment_from_comments(discussion_graph, repo_name, month,15)
+        sentiment_scores = self.extract_sentiment_from_comments(discussion_graph, repo_name, month,20)
         if not sentiment_scores:
             # 检查是否是因为没有comment_body的边
             has_edges = discussion_graph.number_of_edges() > 0
