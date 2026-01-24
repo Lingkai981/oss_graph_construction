@@ -12,7 +12,8 @@
 │  2. 三类图构建      Actor-Actor / Actor-Repo / Actor-Discussion  │
 │  3. 社区氛围分析    情感传播 + 聚类系数 + 网络直径                │
 │  4. 倦怠分析        三层架构评分 + 多维度预警                     │
-│  5. 详细报告        按项目输出完整分析过程                        │
+│  5. Bus Factor 分析 组织参与与控制风险分析                        │
+│  6. 详细报告          按项目输出完整分析过程                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -306,7 +307,34 @@ python -m src.analysis.community_atmosphere_analyzer \
 
 你可以通过直接查看 `output/community-atmosphere-analysis/full_analysis.json` 与 `summary.json`，来进一步探索各项目在不同月份的具体社区氛围变化趋势与结构特征。
 
-### 5. 运行倦怠分析
+### 5. 运行 Bus Factor 分析
+
+```bash
+# 分析所有项目（使用整个时间序列）
+python -m src.analysis.bus_factor_analyzer \
+  --graphs-dir output/monthly-graphs/ \
+  --output-dir output/bus-factor-analysis/
+
+# 单项目单月份分析（用于测试）
+python -m src.analysis.bus_factor_analyzer \
+  --repo angular-angular \
+  --month 2023-01
+
+# 自定义阈值和权重
+python -m src.analysis.bus_factor_analyzer \
+  --threshold 0.6 \
+  --weights-file config/weights.json
+```
+
+**Bus Factor 分析功能**：
+- **Bus Factor 计算**：计算达到总贡献量50%所需的最少贡献者数量
+- **贡献量聚合**：支持可配置权重，综合考虑提交、PR、Issue、评论等贡献类型
+- **时间序列分析**：自动处理整个时间序列，为每个项目生成月度指标时间序列
+- **趋势分析**：使用线性回归计算 Bus Factor 的变化趋势
+- **综合风险评分**：基于当前值和趋势计算综合风险评分（0-100）
+- **断点续传**：支持中断后继续分析，自动跳过已处理的月份
+
+### 6. 运行倦怠分析
 
 ```bash
 python -m src.analysis.burnout_analyzer \
@@ -553,7 +581,8 @@ oss_graph_construction/
 │   │       ├── actor-actor/
 │   │       ├── actor-repo/
 │   │       └── actor-discussion/
-│   └── burnout-analysis/            # 分析结果
+│   ├── burnout-analysis/            # 倦怠分析结果
+│   └── bus-factor-analysis/         # Bus Factor 分析结果
 │       ├── summary.json             # 评分排名
 │       ├── all_alerts.json          # 预警列表
 │       ├── full_analysis.json       # 完整分析数据
@@ -586,6 +615,18 @@ python -m src.analysis.monthly_graph_builder \
   --data-dir data/filtered \
   --output-dir output/monthly-graphs \
   --workers 4                  # 并行进程数
+```
+
+### Bus Factor 分析
+
+```bash
+# 完整分析（所有项目）
+python -m src.analysis.bus_factor_analyzer
+
+# 单项目单月份测试
+python -m src.analysis.bus_factor_analyzer \
+  --repo angular-angular \
+  --month 2023-01
 ```
 
 ### 倦怠分析
