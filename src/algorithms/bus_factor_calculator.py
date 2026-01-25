@@ -20,7 +20,7 @@ logger = get_logger()
 # 默认权重配置（可在配置文件中自定义）
 DEFAULT_WEIGHTS = {
     "commit_count": 1.0,      # 提交次数
-    "pr_merged": 5.0,         # 合并的 PR（高价值）
+    "pr_merged": 3.0,         # 合并的 PR（高价值）
     "pr_opened": 2.0,         # 打开的 PR
     "pr_closed": 1.0,         # 关闭的 PR
     "issue_opened": 1.5,      # 打开的 Issue
@@ -47,16 +47,16 @@ def calculate_bus_factor(
         ValueError: 如果 contributions 为空或 threshold 不在 [0, 1] 范围内
     """
     if not contributions:
-        return 0
+        return None
     
     if not (0.0 <= threshold <= 1.0):
         raise ValueError(f"阈值必须在 [0, 1] 范围内，当前值: {threshold}")
     
     total = sum(contributions.values())
     
-    # 如果总贡献量为0，返回0
+    # 如果总贡献量为0，返回None
     if math.isclose(total, 0.0, abs_tol=1e-9):
-        return 0
+        return None
     
     target = total * threshold
     

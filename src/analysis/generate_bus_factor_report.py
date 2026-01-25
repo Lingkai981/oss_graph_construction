@@ -60,17 +60,32 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     
     # 当前状态分析
     lines.append("\n" + "-" * 80)
-    lines.append("📈 当前状态分析 (50分，基于最近月份)")
+    lines.append("📈 当前状态分析 (50分，基于整个时间序列的加权平均值)")
     lines.append("-" * 80)
     
-    current_bf = latest.get("bus_factor", 0)
-    current_contributors = latest.get("contributor_count", 0)
-    current_contribution = latest.get("total_contribution", 0)
+    # 使用 risk_score 中的 current_bus_factor（基于整个时间序列的加权平均值）
+    current_bf = risk_score.get("current_bus_factor", 0)
     
-    lines.append(f"\n【当前 Bus Factor】")
-    lines.append(f"   📊 Bus Factor: {current_bf}")
-    lines.append(f"   👥 贡献者数量: {current_contributors}")
-    lines.append(f"   📦 总贡献量: {current_contribution:.2f}")
+    # 计算整个时间序列的统计信息
+    total_contributors_all_time = set()
+    total_contribution_all_time = 0.0
+    for m in sorted_metrics:
+        total_contribution_all_time += m.get("total_contribution", 0)
+        contributors = m.get("contributors", [])
+        for c in contributors:
+            total_contributors_all_time.add(c.get("contributor_id"))
+    
+    lines.append(f"\n【当前 Bus Factor（时间序列加权平均）】")
+    lines.append(f"   📊 Bus Factor: {current_bf} (基于 {len(sorted_metrics)} 个月的数据)")
+    lines.append(f"   👥 历史贡献者总数: {len(total_contributors_all_time)}")
+    lines.append(f"   📦 历史总贡献量: {total_contribution_all_time:.2f}")
+    
+    # 显示最新月份的信息作为参考
+    latest_bf = latest.get("bus_factor", 0)
+    latest_contributors = latest.get("contributor_count", 0)
+    latest_contribution = latest.get("total_contribution", 0)
+    lines.append(f"\n   📅 最新月份 ({latest['month']}) 参考:")
+    lines.append(f"      Bus Factor: {latest_bf}, 贡献者: {latest_contributors}, 贡献量: {latest_contribution:.2f}")
     
     # 解释 Bus Factor 含义
     if current_bf == 0:
@@ -142,29 +157,39 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append("📉 趋势分析 (50分，基于时间序列)")
     lines.append("-" * 80)
     
-    trend_analysis = repo_data.get("trend_analysis", {})
-    if trend_analysis:
-        slope = trend_analysis.get("slope", 0)
-        r_squared = trend_analysis.get("r_squared", 0)
-        avg_bf = trend_analysis.get("average_bus_factor", 0)
-        trend_direction = trend_analysis.get("direction", "unknown")
+    trend_data = repo_data.get("trend", {})
+    if trend_data:
+        bus_factor_trend = trend_data.get("bus_factor_trend", {})
+        slope = bus_factor_trend.get("slope", 0)
+        change_rate = bus_factor_trend.get("change_rate", 0)
+        trend_direction = bus_factor_trend.get("direction", "unknown")
+        trend_values = bus_factor_trend.get("values", [])
+        
+        # 计算平均 Bus Factor（从趋势值中计算）
+        if trend_values:
+            valid_values = [v for v in trend_values if v is not None]
+            avg_bf = sum(valid_values) / len(valid_values) if valid_values else 0
+        else:
+            avg_bf = 0
         
         lines.append(f"\n【趋势统计】")
         lines.append(f"   📊 平均 Bus Factor: {avg_bf:.2f}")
         lines.append(f"   📈 线性回归斜率: {slope:+.4f}/月")
-        lines.append(f"   📊 拟合优度 (R²): {r_squared:.3f}")
+        lines.append(f"   📊 变化率: {change_rate:+.2f}%")
         
         # 趋势方向
         if trend_direction == "上升":
             lines.append(f"   ✅ 趋势: {trend_direction} (Bus Factor 逐渐增加，风险降低)")
         elif trend_direction == "下降":
             lines.append(f"   ⚠️ 趋势: {trend_direction} (Bus Factor 逐渐减少，风险增加)")
-        else:
+        elif trend_direction == "稳定":
             lines.append(f"   ➡️ 趋势: {trend_direction} (Bus Factor 保持稳定)")
+        else:
+            lines.append(f"   ➡️ 趋势: {trend_direction}")
         
-        # 早期 vs 近期
-        early_values = [m.get("bus_factor", 0) for m in sorted_metrics[:3]]
-        recent_values = [m.get("bus_factor", 0) for m in sorted_metrics[-3:]]
+        # 早期 vs 近期（过滤 None 值）
+        early_values = [m.get("bus_factor") for m in sorted_metrics[:3] if m.get("bus_factor") is not None]
+        recent_values = [m.get("bus_factor") for m in sorted_metrics[-3:] if m.get("bus_factor") is not None]
         
         if len(early_values) >= 1 and len(recent_values) >= 1:
             early_avg = sum(early_values) / len(early_values)
@@ -181,6 +206,11 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
                 lines.append(f"      ⚠️ 恶化明显: Bus Factor 下降 {abs(change):.2f}")
             else:
                 lines.append(f"      ➡️ 基本稳定: 变化 {change:+.2f}")
+    else:
+        # 如果没有趋势数据，从 risk_score 中获取趋势方向
+        trend_direction = risk_score.get("trend_direction", "未知")
+        lines.append(f"\n【趋势信息】")
+        lines.append(f"   ➡️ 趋势方向: {trend_direction}")
     
     lines.append(f"\n   ➡️ 趋势得分: {trend_score:.2f} / 50")
     
@@ -218,13 +248,15 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     
     for m in sorted_metrics:
         month = m.get("month", "N/A")
-        bf = m.get("bus_factor", 0)
+        bf = m.get("bus_factor")
+        # 处理 None 值，显示为 "N/A"
+        bf_display = "N/A" if bf is None else str(bf)
         contributors = m.get("contributor_count", 0)
         contribution = m.get("total_contribution", 0)
         nodes = m.get("node_count", 0)
         edges = m.get("edge_count", 0)
         
-        lines.append(f"   {month:<12} {bf:>4} {contributors:>8} {contribution:>12.2f} {nodes:>8} {edges:>8}")
+        lines.append(f"   {month:<12} {bf_display:>4} {contributors:>8} {contribution:>12.2f} {nodes:>8} {edges:>8}")
     
     lines.append("")
     return "\n".join(lines)

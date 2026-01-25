@@ -156,7 +156,7 @@ class RiskScore:
     """风险等级（"低" | "中" | "高"）"""
     
     current_bus_factor: int
-    """当前 Bus Factor 值"""
+    """当前 Bus Factor 值（基于整个时间序列的加权平均值，按总贡献量加权）"""
     
     trend_direction: str
     """趋势方向"""

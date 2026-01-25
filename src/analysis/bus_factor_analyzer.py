@@ -161,7 +161,7 @@ class BusFactorAnalyzer:
             return MonthlyRiskMetrics(
                 month=month,
                 repo_name=repo_name,
-                bus_factor=0,
+                bus_factor=None,
                 total_contribution=0.0,
                 contributor_count=len(contributor_contributions),
                 contributors=list(contributor_contributions.values()),
@@ -454,8 +454,8 @@ class BusFactorAnalyzer:
                 logger.warning(f"项目 {repo_name} 没有有效的指标数据，跳过")
                 continue
             
-            # 按月份排序
-            metrics_series.sort(key=lambda m: m.month)
+            # 按月份排序（处理 None 值）
+            metrics_series.sort(key=lambda m: m.month if m.month else "")
             self.repo_metrics[repo_name] = metrics_series
             
             # 确保 all_results 包含最终排序后的指标（即使 resume=False）
@@ -491,6 +491,13 @@ class BusFactorAnalyzer:
         full_analysis_file = self.output_dir / "full_analysis.json"
         # 使用临时文件，写入成功后再重命名（原子操作）
         temp_file = self.output_dir / "full_analysis.json.tmp"
+        
+        # 添加趋势分析和风险评分（如果已计算）
+        for repo_name in results:
+            if repo_name in self.trends:
+                results[repo_name]["trend"] = self.trends[repo_name].to_dict()
+            if repo_name in self.risk_scores:
+                results[repo_name]["risk_score"] = self.risk_scores[repo_name].to_dict()
         
         try:
             # 先写入临时文件
@@ -638,9 +645,13 @@ class BusFactorAnalyzer:
             self.trends[repo_name] = trend_analysis
             return trend_analysis
         
-        # 按月份排序
-        sorted_metrics = sorted(metrics_series, key=lambda m: m.month)
-        bus_factor_values = [m.bus_factor for m in sorted_metrics]
+        # 按月份排序（处理 None 值）
+        sorted_metrics = sorted(metrics_series, key=lambda m: m.month if m.month else "")
+        bus_factor_values = [
+            m.bus_factor
+            for m in sorted_metrics
+            if m.bus_factor is not None
+        ]
         
         # 计算趋势
         trend = self.calculate_trend(bus_factor_values)
@@ -681,11 +692,11 @@ class BusFactorAnalyzer:
         计算综合风险评分（0-100，分数越高风险越高）
         
         Args:
-            current_bus_factor: 当前 Bus Factor 值
+            current_bus_factor: 当前 Bus Factor 值（基于整个时间序列的加权平均值）
             trend_direction: 趋势方向（"上升" | "下降" | "稳定" | "数据不足"）
             trend_change_rate: 变化率（百分比）
-            min_bus_factor: 最小 Bus Factor 值（用于归一化）
-            max_bus_factor: 最大 Bus Factor 值（用于归一化）
+            min_bus_factor: 最小 Bus Factor 值（用于归一化，基于所有项目的所有月份）
+            max_bus_factor: 最大 Bus Factor 值（用于归一化，基于所有项目的所有月份）
         
         Returns:
             风险评分字典
@@ -731,7 +742,7 @@ class BusFactorAnalyzer:
         max_bus_factor: float = None,
     ) -> Optional[RiskScore]:
         """
-        为单个项目计算风险评分
+        为单个项目计算风险评分（基于整个时间序列）
         
         Args:
             repo_name: 项目名称
@@ -756,15 +767,38 @@ class BusFactorAnalyzer:
         if min_bus_factor is None or max_bus_factor is None:
             all_bus_factors = []
             for ms in self.repo_metrics.values():
-                all_bus_factors.extend([m.bus_factor for m in ms])
+                # 过滤 None 值
+                all_bus_factors.extend([m.bus_factor for m in ms if m.bus_factor is not None])
             min_bus_factor = min(all_bus_factors) if all_bus_factors else 1.0
             max_bus_factor = max(all_bus_factors) if all_bus_factors else 50.0
         
-        # 获取当前（最新）Bus Factor
-        sorted_metrics = sorted(metrics_series, key=lambda m: m.month)
-        current_bus_factor = sorted_metrics[-1].bus_factor
+        # 改进：使用整个时间序列的加权平均 Bus Factor（按总贡献量加权）
+        # 先过滤掉 bus_factor 为 None 的指标
+        valid_metrics = [m for m in metrics_series if m.bus_factor is not None]
         
-        # 获取趋势信息
+        if not valid_metrics:
+            logger.warning(f"项目 {repo_name} 没有有效的 Bus Factor 数据，跳过评分")
+            return None
+        
+        # 按月份排序
+        sorted_metrics = sorted(valid_metrics, key=lambda m: m.month if m.month else "")
+        
+        # 计算加权平均 Bus Factor
+        total_weights = sum(m.total_contribution for m in sorted_metrics)
+        if total_weights > 0:
+            # 使用加权平均（按总贡献量加权，更准确反映项目整体状况）
+            avg_bus_factor = sum(
+                m.bus_factor * m.total_contribution 
+                for m in sorted_metrics
+            ) / total_weights
+        else:
+            # 如果总贡献量都是0，使用简单平均
+            avg_bus_factor = sum(m.bus_factor for m in sorted_metrics) / len(sorted_metrics)
+        
+        # 转换为整数（四舍五入）
+        current_bus_factor = int(round(avg_bus_factor))
+        
+        # 获取趋势信息（基于整个时间序列）
         if repo_name in self.trends:
             trend = self.trends[repo_name]
             trend_direction = trend.bus_factor_trend["direction"]
@@ -810,10 +844,15 @@ class BusFactorAnalyzer:
         # 找到所有 Bus Factor 值的范围（用于归一化）
         all_bus_factors = []
         for metrics_series in self.repo_metrics.values():
-            all_bus_factors.extend([m.bus_factor for m in metrics_series])
+            # --- 修复点：添加 if m.bus_factor is not None ---
+            all_bus_factors.extend([m.bus_factor for m in metrics_series if m.bus_factor is not None])
         
-        min_bus_factor = min(all_bus_factors) if all_bus_factors else 1.0
-        max_bus_factor = max(all_bus_factors) if all_bus_factors else 50.0
+        # 增加兜底逻辑，防止整个列表为空
+        if not all_bus_factors:
+            min_bus_factor, max_bus_factor = 1.0, 50.0
+        else:
+            min_bus_factor = min(all_bus_factors)
+            max_bus_factor = max(all_bus_factors)
         
         for repo_name, metrics_series in self.repo_metrics.items():
             if not metrics_series:
@@ -832,10 +871,18 @@ class BusFactorAnalyzer:
         # 找到所有 Bus Factor 值的范围（用于归一化）
         all_bus_factors = []
         for metrics_series in self.repo_metrics.values():
-            all_bus_factors.extend([m.bus_factor for m in metrics_series])
+            # 修复点：过滤 None
+            all_bus_factors.extend([
+                m.bus_factor for m in metrics_series 
+                if m.bus_factor is not None
+            ])
         
-        min_bus_factor = min(all_bus_factors) if all_bus_factors else 1.0
-        max_bus_factor = max(all_bus_factors) if all_bus_factors else 50.0
+        # --- 修复点：增加判空 ---
+        if not all_bus_factors:
+            min_bus_factor, max_bus_factor = 1.0, 50.0
+        else:
+            min_bus_factor = min(all_bus_factors)
+            max_bus_factor = max(all_bus_factors)
         
         # 为所有已分析的项目计算风险评分
         for repo_name in self.repo_metrics.keys():
