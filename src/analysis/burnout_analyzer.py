@@ -28,6 +28,34 @@ from src.utils.logger import get_logger
 
 logger = get_logger()
 
+# ==================== 边权重配置 ====================
+
+# 默认权重配置（可在配置文件中自定义）
+# 权重反映不同类型贡献的价值，用于核心成员识别中的加权度数计算
+#
+# 权重设计原则：
+# 1. PR_MERGE (3.0): 最高权重，合并 PR 是核心维护者的关键职责
+# 2. PR_REVIEW (1.5): 中等权重，代码审查体现技术贡献和协作
+# 3. ISSUE_INTERACTION (0.5): 较低权重，Issue 评论主要是参与讨论
+# 4. ISSUE_CO_PARTICIPANT (0.5): 较低权重，共同参与体现社区参与度
+#
+# 权重合理性评估：
+# - PR_MERGE 从 5.0 降至 3.0 是合理的：
+#   * 3.0 仍然是最高权重，体现其重要性
+#   * 避免过度依赖单一指标（PR 合并）
+#   * 与其他权重（1.5, 0.5）的比例更均衡
+# - 权重比例：3.0 : 1.5 : 0.5 = 6 : 3 : 1，体现了清晰的贡献价值层次
+EDGE_WEIGHTS = {
+    # Actor-Actor 图边类型权重
+    "PR_MERGE": 3.0,              # 合并的 PR（高价值贡献）
+    "PR_REVIEW": 1.5,             # PR 代码审查（中等价值）
+    "ISSUE_INTERACTION": 0.5,     # Issue 评论（参与度）
+    "ISSUE_CO_PARTICIPANT": 0.5,  # 共同参与 Issue（参与度）
+    
+    # 默认权重（如果边类型未在配置中）
+    "default": 1.0,
+}
+
 
 @dataclass
 class MonthlyMetrics:
@@ -120,7 +148,28 @@ class BurnoutAnalyzer:
     def load_graph(self, graph_path: str) -> Optional[nx.MultiDiGraph]:
         """加载图"""
         try:
-            return nx.read_graphml(graph_path)
+            graph = nx.read_graphml(graph_path)
+            # 确保返回 MultiDiGraph
+            if isinstance(graph, nx.MultiDiGraph):
+                return graph
+            elif isinstance(graph, nx.DiGraph):
+                # 转换为 MultiDiGraph
+                multi_graph = nx.MultiDiGraph()
+                multi_graph.add_nodes_from(graph.nodes(data=True))
+                multi_graph.add_edges_from(graph.edges(data=True))
+                multi_graph.graph.update(graph.graph)
+                return multi_graph
+            elif isinstance(graph, (nx.Graph, nx.MultiGraph)):
+                # 如果是无向图，先转为有向图再转为 MultiDiGraph
+                di_graph = graph.to_directed()
+                multi_graph = nx.MultiDiGraph()
+                multi_graph.add_nodes_from(di_graph.nodes(data=True))
+                multi_graph.add_edges_from(di_graph.edges(data=True))
+                multi_graph.graph.update(di_graph.graph)
+                return multi_graph
+            else:
+                logger.warning(f"未知的图类型: {type(graph)}, 路径: {graph_path}")
+                return None
         except Exception as e:
             logger.warning(f"加载图失败: {graph_path}, 错误: {e}")
             return None
@@ -160,11 +209,44 @@ class BurnoutAnalyzer:
                     variance = sum((d - metrics.degree_mean) ** 2 for d in degree_values) / len(degree_values)
                     metrics.degree_std = math.sqrt(variance)
                 
-                # ========== 智能核心成员识别（多信号融合）==========
+                # ========== 智能核心成员识别（多信号融合 + 边权重）==========
                 total_actors = len(degrees)
-                total_degree = sum(degree_values)
                 
-                # 1. 计算 k-core 分解（网络结构核心）
+                # 1. 计算加权度数（考虑边类型权重）
+                weighted_degrees = {}
+                is_multigraph = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+                
+                for node_id in graph.nodes():
+                    weighted_degree = 0.0
+                    # 遍历节点的所有出边
+                    if is_multigraph:
+                        for _, _, key, data in graph.out_edges(node_id, keys=True, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    else:
+                        for _, _, data in graph.out_edges(node_id, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    # 遍历节点的所有入边
+                    if is_multigraph:
+                        for _, _, key, data in graph.in_edges(node_id, keys=True, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    else:
+                        for _, _, data in graph.in_edges(node_id, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    weighted_degrees[node_id] = weighted_degree
+                
+                weighted_degree_values = list(weighted_degrees.values())
+                total_weighted_degree = sum(weighted_degree_values)
+                max_weighted_degree = max(weighted_degree_values) if weighted_degree_values else 1
+                
+                # 2. 计算 k-core 分解（网络结构核心）
                 try:
                     # 转换为无向图进行 k-core 分解
                     undirected = graph.to_undirected()
@@ -174,21 +256,23 @@ class BurnoutAnalyzer:
                     core_numbers = {n: 1 for n in graph.nodes()}
                     max_k = 1
                 
-                # 2. 计算综合得分：贡献量（60%）+ 网络位置（40%）
+                # 3. 计算综合得分：加权贡献量（50%）+ 网络位置（50%）
                 actor_scores = {}
                 for node_id in graph.nodes():
-                    degree = degrees.get(node_id, 0)
+                    weighted_degree = weighted_degrees.get(node_id, 0.0)
+                    raw_degree = degrees.get(node_id, 0)  # 保留原始度数为兼容性
                     kcore = core_numbers.get(node_id, 0)
                     
                     # 归一化
-                    degree_norm = degree / max(metrics.degree_max, 1)
+                    weighted_degree_norm = weighted_degree / max(max_weighted_degree, 1)
                     kcore_norm = kcore / max(max_k, 1)
                     
-                    # 综合得分
-                    score = 0.6 * degree_norm + 0.4 * kcore_norm
+                    # 综合得分（使用加权度数）
+                    score = 0.5 * weighted_degree_norm + 0.5 * kcore_norm
                     actor_scores[node_id] = {
                         "score": score,
-                        "degree": degree,
+                        "weighted_degree": weighted_degree,
+                        "degree": raw_degree,  # 保留原始度数
                         "kcore": kcore,
                     }
                 
@@ -199,39 +283,36 @@ class BurnoutAnalyzer:
                     reverse=True
                 )
                 
-                # 4. 动态确定核心成员数量（三重约束）
-                #    - 贡献阈值：累计贡献 >= 70%
-                #    - 人数上限：最多 30% 的人
-                #    - 得分阈值：得分 >= 平均得分
-                contribution_threshold = total_degree * 0.7
-                max_core_count = max(3, int(total_actors * 0.3))
+                # 4. 动态确定核心成员数量（双重约束）
+                #    - 贡献阈值：累计加权贡献 >= 50%
+                #    - 得分阈值：得分 >= 平均得分（且已有至少 3 人）
+                contribution_threshold = total_weighted_degree * 0.5
                 avg_score = sum(s["score"] for s in actor_scores.values()) / len(actor_scores) if actor_scores else 0
                 
-                cumsum = 0
+                cumsum = 0.0  # 使用加权度数的累计值
                 for node_id, score_data in sorted_actors:
                     login = graph.nodes[node_id].get("login", node_id)
                     actor_id = graph.nodes[node_id].get("actor_id", 0)
-                    degree = score_data["degree"]
+                    weighted_degree = score_data["weighted_degree"]
+                    raw_degree = score_data["degree"]  # 保留原始度数为显示
                     
-                    # 兼容旧代码：top_actors 保留前 10 个
+                    # 兼容旧代码：top_actors 保留前 10 个（使用原始度数）
                     if len(metrics.top_actors) < 10:
-                        metrics.top_actors.append((login, degree))
+                        metrics.top_actors.append((login, raw_degree))
                         metrics.top_actor_ids.append(actor_id)
                     
                     # 核心成员：满足以下条件之一时停止
-                    # 1. 已达到 70% 贡献阈值
-                    # 2. 已达到 30% 人数上限
-                    # 3. 得分低于平均值（且已有至少 3 人）
+                    # 1. 已达到 50% 加权贡献阈值
+                    # 2. 得分低于平均值（且已有至少 3 人）
                     should_stop = (
                         cumsum >= contribution_threshold or
-                        len(metrics.core_actors) >= max_core_count or
                         (score_data["score"] < avg_score and len(metrics.core_actors) >= 3)
                     )
                     
                     if not should_stop:
-                        metrics.core_actors.append((login, degree))
+                        metrics.core_actors.append((login, raw_degree))  # 显示用原始度数
                         metrics.core_actor_ids.append(actor_id)
-                        cumsum += degree
+                        cumsum += weighted_degree  # 累计使用加权度数
                 
                 # 确保至少有 2 个核心成员
                 if len(metrics.core_actors) < 2 and len(sorted_actors) >= 2:
