@@ -10,8 +10,9 @@
 ├─────────────────────────────────────────────────────────────────┤
 │  1. 数据采集        从 GitHub Archive 下载并过滤代表性项目数据    │
 │  2. 三类图构建      Actor-Actor / Actor-Repo / Actor-Discussion  │
-│  3. 倦怠分析        三层架构评分 + 多维度预警                     │
-│  4. 详细报告        按项目输出完整分析过程                        │
+│  3. 新人体验分析    新人融入路径 + 核心距离 + 晋升成本            │
+│  4. 安全风险分析    低质参与 / 权限投机 / 可疑行为识别            │
+│  5. 详细报告        面向项目 & 个体的可解释分析报告               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -47,22 +48,29 @@ python -m src.analysis.monthly_graph_builder \
   --workers 4
 ```
 
-### 4. 运行倦怠分析
+### 4. 运行分析
 
 ```bash
-python -m src.analysis.burnout_analyzer \
+# 新人体验分析
+python -m src.analysis.newcomer_analyzer \
   --graphs-dir output/monthly-graphs \
-  --output-dir output/burnout-analysis
+  --output-dir output/newcomer-analysis
+# 安全问题分析
+python -m src.analysis.quality_risk_analyzer \
+  --graphs-dir output/monthly-graphs \
+  --output-dir output/quality-risk
 ```
 
 ### 5. 查看详细报告
 
 ```bash
 # 查看前 10 个高风险项目
-python -m src.analysis.detailed_report --top 10
+python -m src.analysis.newcomer_detailed_report --top 10
+python -m src.analysis.quality_risk_detailed_report --top 10
 
 # 查看指定项目
-python -m src.analysis.detailed_report --repo "kubernetes/kubernetes"
+python -m src.analysis.newcomer_detailed_report --repo "kubernetes/kubernetes"
+python -m src.analysis.quality_risk_detailed_report --repo "kubernetes/kubernetes"
 ```
 
 ---
@@ -144,11 +152,11 @@ Developer C ──PARTICIPANT──> Issue #123
 
 ---
 
-## 倦怠分析算法
+## 新人体验分析算法
 
 ### 三层评分架构
 
-每个维度（活跃度、贡献者、核心成员、协作密度）都使用三层分析：
+每个维度（人际距离，时间距离，单不可达比例, 全不可达比例）都使用三层分析：
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -175,10 +183,10 @@ Developer C ──PARTICIPANT──> Issue #123
 
 | 维度 | 权重 | 数据来源 | 说明 |
 |-----|------|---------|------|
-| **活跃度** | 0-25分 | `total_events` | 月度事件总数变化 |
-| **贡献者** | 0-25分 | `unique_actors` | 月度活跃人数变化 |
-| **核心成员** | 0-25分 | `core_actors` 留存率 | 核心成员流失情况 |
-| **协作密度** | 0-25分 | `density` | 网络密度变化 |
+| **人际距离** | 0-25分 | `NewcomerDistanceRecord` | 新人加入时到核心成员的平均最短路径长度 |
+| **时间距离** | 0-25分 | `PeripheryToCoreRecord` | 核心成员从首次出现到首次成为 core 的耗时（月） |
+| **单不可达比例** | 0-25分 | `unreachable_to_any_core_count` | 非核心成员和任意核心成员之间不可达的数量统计 |
+| **全不可达比例** | 0-25分 | `unreachable_to_all_core_count` | 非核心成员和所有核心成员之间不可达的数量统计 |
 
 ### 核心成员识别算法
 

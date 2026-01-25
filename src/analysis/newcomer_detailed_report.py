@@ -1,30 +1,32 @@
 """
-Newcomer / Core-evolution 详细报告生成器
+Newcomer / Core-evolution 详细报告生成器（优化版）
 
-适配 newcomer_analyzer_v3 的输出结构（output/newcomer-analysis/full_analysis.json）。
+基于 newcomer_analyzer 输出结构（output/newcomer-analysis/full_analysis.json）生成面向阅读者的可解释报告。
 
-输出内容（按项目）：
-- 指标1：新人加入时到当月核心成员的平均最短路径（overall + 月度趋势）
-- 指标2：核心成员从首次出现到首次成为 core 的耗时（overall + “每月新晋核心”月度趋势）
-- 指标3：非核心成员与核心成员不可达统计（overall + 月度趋势；区分 any/all）
-- 三层分析：对三个指标的月度序列做长期趋势/近期状态/稳定性分析（若存在）
+本版本在原有基础上新增：
+1) 每个项目显示“总得分”（四个三层分析 total_score 之和）
+2) 每个项目显示“预警等级”（参考 README.md 风险等级划分逻辑）
+3) 若单项三层得分 > 15（严格大于），则单独给出问题来源说明（可解释提示）
 
 用法示例：
-python -m src.analysis.newcomer_detailed_report --top 10
-python -m src.analysis.newcomer_detailed_report --repo "kubernetes/kubernetes"
+python -m src.analysis.newcomer_detailed_report_optimized --top 10
+python -m src.analysis.newcomer_detailed_report_optimized --repo "kubernetes/kubernetes"
 """
 
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 from datetime import datetime
 
 
+# -----------------------------
+# Format helpers
+# -----------------------------
 def _fmt(v: Any, default: str = "N/A", ndigits: int = 4) -> str:
     if v is None:
         return default
-    if isinstance(v, (int,)):
+    if isinstance(v, int):
         return str(v)
     if isinstance(v, float):
         return f"{v:.{ndigits}f}"
@@ -40,6 +42,63 @@ def _fmt_pct(v: Any, default: str = "N/A", ndigits: int = 2) -> str:
         return default
 
 
+# -----------------------------
+# Scoring & warning level
+# -----------------------------
+_THREE_LAYER_KEYS = [
+    "newcomer_distance",
+    "periphery_to_core_monthly",
+    "unreachable_to_all_core_rate",
+    "unreachable_to_any_core_rate",
+]
+
+
+def compute_total_score(repo_data: Dict[str, Any]) -> float:
+    """四个三层分析 total_score 之和（缺失项按 0 计）。"""
+    three = repo_data.get("three_layer_analysis", {}) or {}
+    total = 0.0
+    for k in _THREE_LAYER_KEYS:
+        total += float((three.get(k, {}) or {}).get("total_score") or 0.0)
+    return total
+
+
+def warning_level(total_score: float) -> Tuple[str, str]:
+    """参考 README.md 的风险等级划分逻辑。"""
+    # README: ≥60 high, 40-59 medium, 20-39 low, <20 healthy
+    if total_score >= 60:
+        return "🔴", "high"
+    if total_score >= 40:
+        return "🟠", "medium"
+    if total_score >= 20:
+        return "🟡", "low"
+    return "🟢", "healthy"
+
+
+def flagged_issues(repo_data: Dict[str, Any], threshold: float = 15.0) -> List[Tuple[str, float, str]]:
+    """返回单项 total_score > threshold 的问题说明列表：[(key, score, message), ...]."""
+    three = repo_data.get("three_layer_analysis", {}) or {}
+
+    explanations = {
+        "newcomer_distance": "新人和核心贡献者联系不够紧密",
+        "periphery_to_core_monthly": "新人需要较长时间才能成为核心",
+        # 对可达性两项，给出同一类解释并标明口径
+        "unreachable_to_all_core_rate": "新人和核心贡献者之间可达性断裂（与所有 core 不可达）",
+        "unreachable_to_any_core_rate": "新人和核心贡献者之间可达性断裂（与至少一个 core 不可达）",
+    }
+
+    out: List[Tuple[str, float, str]] = []
+    for k in _THREE_LAYER_KEYS:
+        score = float((three.get(k, {}) or {}).get("total_score") or 0.0)
+        if score > threshold:
+            out.append((k, score, explanations.get(k, k)))
+    # 按严重程度从高到低
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+
+# -----------------------------
+# Report blocks
+# -----------------------------
 def _fmt_score_block(name: str, three_layer: Dict[str, Any]) -> List[str]:
     lines: List[str] = []
     if not three_layer:
@@ -56,7 +115,9 @@ def _fmt_score_block(name: str, three_layer: Dict[str, Any]) -> List[str]:
     lines.append(f"   【{name}】")
     lines.append(f"      数据点数: {n_points}")
     lines.append(f"      三层总分: {_fmt(total, ndigits=4)} / 25")
-    lines.append(f"      📉 长期趋势: slope={_fmt(trend.get('slope'), ndigits=6)}  score={_fmt(trend.get('score'), ndigits=4)}")
+    lines.append(
+        f"      📉 长期趋势: slope={_fmt(trend.get('slope'), ndigits=6)}  score={_fmt(trend.get('score'), ndigits=4)}"
+    )
     lines.append(
         f"      📅 近期状态: early_avg={_fmt(recent.get('early_avg'))}  recent_avg={_fmt(recent.get('recent_avg'))}  "
         f"change={_fmt(recent.get('change'), ndigits=6)}  score={_fmt(recent.get('score'), ndigits=4)}"
@@ -77,7 +138,22 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     newcomer = repo_data.get("newcomer_distance", {})
     p2c = repo_data.get("periphery_to_core", {})
     reach = repo_data.get("core_reachability", {})
-    three = repo_data.get("three_layer_analysis", {})
+    three = repo_data.get("three_layer_analysis", {}) or {}
+
+    # ---- 总得分 & 预警等级 ----
+    total_score = compute_total_score(repo_data)
+    icon, level = warning_level(total_score)
+
+    lines.append(f"⭐ 总得分（四项三层总分之和）: {_fmt(total_score, ndigits=4)}")
+    lines.append(f"{icon} 预警等级: {level}")
+
+    issues = flagged_issues(repo_data, threshold=15.0)
+    if issues:
+        lines.append("⚠️ 单项异常说明（单项得分 > 15）:")
+        for _, score, msg in issues:
+            lines.append(f"   - {msg}（得分: {_fmt(score, ndigits=4)}）")
+    else:
+        lines.append("✅ 单项异常说明: 无（所有单项得分 ≤ 15）")
 
     # ---- 概览 ----
     overall_dist = newcomer.get("overall_avg_shortest_path_to_core")
@@ -89,7 +165,7 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append("\n🎯 指标概览（项目级）")
     lines.append(f"   ① 新人到核心平均步长（overall）: {_fmt(overall_dist)}")
     lines.append(f"   ② Periphery→Core 平均耗时（月）（overall）: {_fmt(avg_months_to_core)}")
-    lines.append(f"   ③ 不可达比例（overall）:")
+    lines.append("   ③ 不可达比例（overall）:")
     lines.append(f"      - 与所有 core 不可达: {_fmt_pct(unreach_all_rate)}")
     lines.append(f"      - 与至少一个 core 不可达: {_fmt_pct(unreach_any_rate)}")
 
@@ -112,7 +188,6 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     p2c_monthly = p2c.get("monthly_summary", []) or []
     reach_monthly = reach.get("monthly_summary", []) or []
 
-    # 建索引（按 month）
     def _index_by_month(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         for it in items:
@@ -165,26 +240,13 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# 兼容原 --top 排序逻辑：按总得分（四项三层总分之和）降序
 def _compute_sort_key(repo_data: Dict[str, Any]) -> float:
-    """
-    用于 --top 的排序：默认按四个三层总分之和（越高代表变化/风险信号越强）。
-    若缺失则退化为 0。
-    """
-    three = repo_data.get("three_layer_analysis", {}) or {}
-    keys = [
-        "newcomer_distance",
-        "periphery_to_core_monthly",
-        "unreachable_to_all_core_rate",
-        "unreachable_to_any_core_rate",
-    ]
-    total = 0.0
-    for k in keys:
-        total += float((three.get(k, {}) or {}).get("total_score") or 0.0)
-    return total
+    return compute_total_score(repo_data)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成 Newcomer / Core-evolution 详细分析报告")
+    parser = argparse.ArgumentParser(description="生成 Newcomer / Core-evolution 详细分析报告（优化版）")
     parser.add_argument(
         "--input",
         type=str,
@@ -194,7 +256,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="output/newcomer-analysis/detailed_report.txt",
+        default="output/newcomer-analysis/detailed_report_optimized.txt",
         help="输出报告文件路径",
     )
     parser.add_argument(
@@ -207,7 +269,7 @@ def main():
         "--top",
         type=int,
         default=None,
-        help="只输出信号强度（四个三层总分之和）最高的前 N 个项目",
+        help="只输出总得分最高的前 N 个项目（总得分=四项三层总分之和）",
     )
 
     args = parser.parse_args()
@@ -247,7 +309,7 @@ def main():
     # 生成报告
     reports: List[str] = []
     reports.append("=" * 90)
-    reports.append("🔍 OSS 项目 Newcomer / Core-evolution 详细分析报告")
+    reports.append("🔍 OSS 项目 Newcomer / Core-evolution 详细分析报告（优化版）")
     reports.append("=" * 90)
     reports.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     reports.append(f"分析项目数: {len(repos_ranked)}")
