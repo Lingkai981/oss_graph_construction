@@ -66,7 +66,7 @@ class MonthlyMetrics:
     # 基础网络指标
     node_count: int = 0
     edge_count: int = 0
-    density: float = 0.0
+    clustering_coefficient: float = 0.0  # 平均聚类系数（替代密度）
     
     # 活跃度指标
     total_events: int = 0
@@ -96,7 +96,7 @@ class MonthlyMetrics:
             "repo_name": self.repo_name,
             "node_count": self.node_count,
             "edge_count": self.edge_count,
-            "density": self.density,
+            "clustering_coefficient": self.clustering_coefficient,
             "total_events": self.total_events,
             "unique_actors": self.unique_actors,
             "core_actors": self.core_actors,
@@ -187,9 +187,25 @@ class BurnoutAnalyzer:
         metrics.node_count = graph.number_of_nodes()
         metrics.edge_count = graph.number_of_edges()
         
-        if metrics.node_count > 1:
-            max_edges = metrics.node_count * (metrics.node_count - 1)
-            metrics.density = metrics.edge_count / max_edges if max_edges > 0 else 0
+        # 计算平均聚类系数（替代密度）
+        if metrics.node_count > 2:
+            try:
+                # 转为无向图并合并多重边（使用 nx.Graph 会自动合并）
+                # 先转为无向图，再创建普通 Graph 以合并多重边
+                undirected_multi = graph.to_undirected()
+                # 创建普通 Graph，会自动合并多重边
+                undirected = nx.Graph(undirected_multi)
+                clustering = nx.clustering(undirected)
+                if clustering:
+                    metrics.clustering_coefficient = sum(clustering.values()) / len(clustering)
+                else:
+                    metrics.clustering_coefficient = 0.0
+            except Exception as e:
+                logger.warning(f"计算聚类系数失败: {repo_name}/{month}, 错误: {e}")
+                metrics.clustering_coefficient = 0.0
+        else:
+            # 节点数 <= 2 时，无法计算有意义的聚类系数
+            metrics.clustering_coefficient = 0.0
         
         # 从图元数据获取
         metrics.total_events = graph.graph.get("total_events", 0)
@@ -396,20 +412,20 @@ class BurnoutAnalyzer:
                         },
                     ))
             
-            # 3. 网络密度下降（协作减少）
-            if prev.density > 0:
-                density_change = (curr.density - prev.density) / prev.density
-                if density_change < -0.3:  # 下降超过 30%
+            # 3. 聚类系数下降（协作质量下降）
+            if prev.clustering_coefficient > 0:
+                clustering_change = (curr.clustering_coefficient - prev.clustering_coefficient) / prev.clustering_coefficient
+                if clustering_change < -0.3:  # 下降超过 30%
                     alerts.append(BurnoutAlert(
                         repo_name=repo_name,
                         month=curr.month,
                         alert_type="COLLABORATION_DECLINE",
                         severity="medium",
-                        description=f"网络密度下降 {abs(density_change)*100:.1f}%",
+                        description=f"协作质量下降（聚类系数下降 {abs(clustering_change)*100:.1f}%）",
                         metrics={
-                            "prev_density": prev.density,
-                            "curr_density": curr.density,
-                            "change_rate": density_change,
+                            "prev_clustering": prev.clustering_coefficient,
+                            "curr_clustering": curr.clustering_coefficient,
+                            "change_rate": clustering_change,
                         },
                     ))
             
@@ -494,6 +510,7 @@ class BurnoutAnalyzer:
         values: List[float],
         dimension_name: str,
         max_score: float = 25.0,
+        reverse: bool = False,
     ) -> Dict[str, Any]:
         """
         计算单个维度的倦怠得分（三层分析）
@@ -502,6 +519,9 @@ class BurnoutAnalyzer:
         - 长期趋势 (40%): 线性回归斜率
         - 近期状态 (40%): 最近3个月 vs 最早3个月
         - 稳定性 (20%): 波动率惩罚
+        
+        Args:
+            reverse: 如果为 True，逻辑反转（用于流失率等：上升得高分，下降得低分）
         """
         n = len(values)
         if n < 2 or all(v == 0 for v in values):
@@ -517,10 +537,13 @@ class BurnoutAnalyzer:
         normalized = [v / first_nonzero for v in values]
         
         # ========== 1. 长期趋势 (40%) ==========
-        # 线性回归斜率，负斜率表示下降
+        # 线性回归斜率
         slope = self._linear_regression_slope(normalized)
-        # 假设 -0.1/月（每月下降10%）为极端情况
-        trend_score = max(0, min(max_score * 0.4, -slope * max_score * 4))
+        # 默认逻辑：负斜率（下降）得高分；reverse=True 时：正斜率（上升）得高分
+        if reverse:
+            trend_score = max(0, min(max_score * 0.4, slope * max_score * 4))
+        else:
+            trend_score = max(0, min(max_score * 0.4, -slope * max_score * 4))
         
         # ========== 2. 近期状态 (40%) ==========
         # 对比最近3个月和最早3个月的均值
@@ -533,7 +556,11 @@ class BurnoutAnalyzer:
         else:
             recent_change = 0
         
-        recent_score = max(0, min(max_score * 0.4, -recent_change * max_score * 0.4))
+        # 默认逻辑：变化率 < 0（下降）得高分；reverse=True 时：变化率 > 0（上升）得高分
+        if reverse:
+            recent_score = max(0, min(max_score * 0.4, recent_change * max_score * 0.4))
+        else:
+            recent_score = max(0, min(max_score * 0.4, -recent_change * max_score * 0.4))
         
         # ========== 3. 稳定性惩罚 (20%) ==========
         # 波动率 > 0.3 开始扣分
@@ -624,8 +651,9 @@ class BurnoutAnalyzer:
         churn_values = [1 - r for r in retention_values]
         
         # 核心成员流失分析
+        # 流失率上升（上升趋势）应该得高分，所以使用 reverse=True
         core_detail = self._compute_dimension_score(
-            churn_values, "core_churn", max_score=25
+            churn_values, "core_churn", max_score=25, reverse=True
         )
         
         # 添加额外的核心成员信息
@@ -641,32 +669,38 @@ class BurnoutAnalyzer:
         
         factors["core_stability"] = core_detail
         
-        # ========== 4. 协作密度 (0-25分) ==========
-        density_values = [m.density for m in sorted_metrics]
+        # ========== 4. 协作质量 (0-25分) ==========
+        # 使用聚类系数替代密度，反映协作网络的紧密程度
+        clustering_values = [m.clustering_coefficient for m in sorted_metrics]
         factors["collaboration"] = self._compute_dimension_score(
-            density_values, "collaboration", max_score=25
+            clustering_values, "collaboration", max_score=25
         )
         
         # ========== 综合评分 ==========
-        total_score = (
+        # 计算倦怠风险得分（0-100，越高越差）
+        burnout_risk_score = (
             factors["activity"]["score"] +
             factors["contributors"]["score"] +
             factors["core_stability"]["score"] +
             factors["collaboration"]["score"]
         )
         
-        # 风险等级
-        if total_score >= 60:
-            level = "high"
-        elif total_score >= 40:
-            level = "medium"
-        elif total_score >= 20:
-            level = "low"
+        # 转换为健康度得分（0-100，越高越好）
+        health_score = 100 - burnout_risk_score
+        
+        # 风险等级（基于健康度得分）
+        if health_score < 40:
+            level = "high"  # 健康度 < 40，高风险
+        elif health_score < 60:
+            level = "medium"  # 健康度 40-59，中等风险
+        elif health_score < 80:
+            level = "low"  # 健康度 60-79，低风险
         else:
-            level = "healthy"
+            level = "healthy"  # 健康度 ≥ 80，健康
         
         return {
-            "score": round(total_score, 2),
+            "score": round(health_score, 2),
+            "burnout_risk_score": round(burnout_risk_score, 2),  # 保留原始风险得分供参考
             "level": level,
             "factors": factors,
             "months_analyzed": n,
