@@ -155,8 +155,8 @@ class RiskScore:
     risk_level: str
     """风险等级（"低" | "中" | "高"）"""
     
-    current_bus_factor: int
-    """当前 Bus Factor 值（基于整个时间序列的加权平均值，按总贡献量加权）"""
+    weighted_avg_bus_factor: int
+    """Bus Factor 加权平均值（基于整个时间序列，按总贡献量加权）"""
     
     trend_direction: str
     """趋势方向"""
@@ -169,7 +169,7 @@ class RiskScore:
             "current_score": round(self.current_score, 2),
             "trend_score": round(self.trend_score, 2),
             "risk_level": self.risk_level,
-            "current_bus_factor": self.current_bus_factor,
+            "weighted_avg_bus_factor": self.weighted_avg_bus_factor,
             "trend_direction": self.trend_direction,
         }
 

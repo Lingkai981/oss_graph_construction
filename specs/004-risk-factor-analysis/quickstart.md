@@ -50,6 +50,7 @@ python -m src.analysis.bus_factor_analyzer
 
 这将：
 - 从 `output/monthly-graphs/` 读取所有项目的 actor-repo 图文件
+- 使用多进程并行处理（默认使用 CPU 核心数）
 - 计算每个项目的每个月的 Bus Factor
 - 生成时间序列趋势分析
 - 计算综合风险评分
@@ -70,6 +71,26 @@ python -m src.analysis.bus_factor_analyzer \
 python -m src.analysis.bus_factor_analyzer \
   --threshold 0.6  # 使用 60% 作为阈值
 ```
+
+### 4. 多进程并行处理
+
+默认情况下，分析器会自动使用多进程并行处理不同项目，显著提升分析速度。
+
+```bash
+# 指定并行工作进程数（推荐设置为 CPU 核心数）
+python -m src.analysis.bus_factor_analyzer \
+  --workers 4
+
+# 使用单进程模式（便于调试）
+python -m src.analysis.bus_factor_analyzer \
+  --workers 1
+```
+
+**性能说明**：
+- **理论加速比**：接近 `workers` 倍（取决于 CPU 核心数和 I/O 瓶颈）
+- **实际加速比**：通常为 `workers × 0.7-0.9`（受 I/O、内存等因素影响）
+- **内存使用**：多进程会增加内存占用（每个进程独立加载图数据）
+- **断点续传**：多进程模式下仍支持断点续传
 
 ## 高级配置
 

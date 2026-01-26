@@ -63,20 +63,48 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append("📈 当前状态分析 (50分，基于整个时间序列的加权平均值)")
     lines.append("-" * 80)
     
-    # 使用 risk_score 中的 current_bus_factor（基于整个时间序列的加权平均值）
-    current_bf = risk_score.get("current_bus_factor", 0)
+    # 使用 risk_score 中的 weighted_avg_bus_factor（基于整个时间序列的加权平均值）
+    weighted_avg_bf = risk_score.get("weighted_avg_bus_factor", 0)
     
-    # 计算整个时间序列的统计信息
+    # 计算整个时间序列的统计信息并聚合贡献者数据
     total_contributors_all_time = set()
     total_contribution_all_time = 0.0
+    all_time_contributors = {}  # 聚合所有月份的贡献者数据
+    
     for m in sorted_metrics:
         total_contribution_all_time += m.get("total_contribution", 0)
         contributors = m.get("contributors", [])
         for c in contributors:
-            total_contributors_all_time.add(c.get("contributor_id"))
+            contributor_id = c.get("contributor_id")
+            total_contributors_all_time.add(contributor_id)
+            
+            # 聚合贡献者数据
+            if contributor_id not in all_time_contributors:
+                all_time_contributors[contributor_id] = {
+                    "contributor_id": contributor_id,
+                    "login": c.get("login", f"contributor_{contributor_id}"),
+                    "total_contribution": 0.0,
+                    "commit_count": 0,
+                    "pr_merged": 0,
+                    "pr_opened": 0,
+                    "pr_closed": 0,
+                    "issue_opened": 0,
+                    "issue_closed": 0,
+                    "comment_count": 0,
+                }
+            
+            # 累加贡献量
+            all_time_contributors[contributor_id]["total_contribution"] += c.get("total_contribution", 0)
+            all_time_contributors[contributor_id]["commit_count"] += c.get("commit_count", 0)
+            all_time_contributors[contributor_id]["pr_merged"] += c.get("pr_merged", 0)
+            all_time_contributors[contributor_id]["pr_opened"] += c.get("pr_opened", 0)
+            all_time_contributors[contributor_id]["pr_closed"] += c.get("pr_closed", 0)
+            all_time_contributors[contributor_id]["issue_opened"] += c.get("issue_opened", 0)
+            all_time_contributors[contributor_id]["issue_closed"] += c.get("issue_closed", 0)
+            all_time_contributors[contributor_id]["comment_count"] += c.get("comment_count", 0)
     
     lines.append(f"\n【当前 Bus Factor（时间序列加权平均）】")
-    lines.append(f"   📊 Bus Factor: {current_bf} (基于 {len(sorted_metrics)} 个月的数据)")
+    lines.append(f"   📊 Bus Factor: {weighted_avg_bf} (基于 {len(sorted_metrics)} 个月的数据)")
     lines.append(f"   👥 历史贡献者总数: {len(total_contributors_all_time)}")
     lines.append(f"   📦 历史总贡献量: {total_contribution_all_time:.2f}")
     
@@ -88,25 +116,30 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append(f"      Bus Factor: {latest_bf}, 贡献者: {latest_contributors}, 贡献量: {latest_contribution:.2f}")
     
     # 解释 Bus Factor 含义
-    if current_bf == 0:
+    if weighted_avg_bf == 0:
         lines.append(f"   ⚠️ 极高风险: 无有效贡献或总贡献量为0")
-    elif current_bf == 1:
+    elif weighted_avg_bf == 1:
         lines.append(f"   🔴 极高风险: 仅1人就能贡献50%以上的工作量")
-    elif current_bf == 2:
+    elif weighted_avg_bf == 2:
         lines.append(f"   🔴 高风险: 仅2人就能贡献50%以上的工作量")
-    elif current_bf <= 5:
-        lines.append(f"   🟡 中风险: {current_bf}人贡献了50%以上的工作量")
+    elif weighted_avg_bf <= 5:
+        lines.append(f"   🟡 中风险: {weighted_avg_bf}人贡献了50%以上的工作量")
     else:
-        lines.append(f"   🟢 低风险: {current_bf}人贡献了50%以上的工作量，贡献较为分散")
+        lines.append(f"   🟢 低风险: {weighted_avg_bf}人贡献了50%以上的工作量，贡献较为分散")
     
-    # 显示 Top 贡献者
-    top_contributors = latest.get("contributors", [])[:5]
-    if top_contributors:
-        lines.append(f"\n   🏆 Top 5 贡献者:")
-        for i, contributor in enumerate(top_contributors, 1):
+    # 显示 Top 贡献者（基于整个时间序列聚合）
+    sorted_all_time_contributors = sorted(
+        all_time_contributors.values(),
+        key=lambda x: x["total_contribution"],
+        reverse=True
+    )[:5]
+    
+    if sorted_all_time_contributors and total_contribution_all_time > 0:
+        lines.append(f"\n   🏆 Top 5 贡献者（整个时间序列）:")
+        for i, contributor in enumerate(sorted_all_time_contributors, 1):
             login = contributor.get("login", "unknown")
             contrib = contributor.get("total_contribution", 0)
-            ratio = contributor.get("contribution_ratio", 0) * 100
+            ratio = (contrib / total_contribution_all_time * 100) if total_contribution_all_time > 0 else 0
             
             # 详细活动统计
             commits = contributor.get("commit_count", 0)
@@ -138,18 +171,18 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     
     # 计算当前状态得分
     lines.append(f"\n   ➡️ 当前状态得分计算:")
-    if current_bf == 0:
+    if weighted_avg_bf == 0:
         lines.append(f"      Bus Factor = 0 → 极高风险 → 50分")
-    elif current_bf == 1:
+    elif weighted_avg_bf == 1:
         lines.append(f"      Bus Factor = 1 → 极高风险 → 50分")
-    elif current_bf == 2:
+    elif weighted_avg_bf == 2:
         lines.append(f"      Bus Factor = 2 → 高风险 → 47.22分")
-    elif current_bf == 3:
+    elif weighted_avg_bf == 3:
         lines.append(f"      Bus Factor = 3 → 高风险 → 44.44分")
-    elif current_bf <= 5:
-        lines.append(f"      Bus Factor = {current_bf} → 中风险")
+    elif weighted_avg_bf <= 5:
+        lines.append(f"      Bus Factor = {weighted_avg_bf} → 中风险")
     else:
-        lines.append(f"      Bus Factor = {current_bf} → 低风险")
+        lines.append(f"      Bus Factor = {weighted_avg_bf} → 低风险")
     lines.append(f"      最终得分: {current_score:.2f} / 50")
     
     # 趋势分析
@@ -294,11 +327,11 @@ def generate_summary_report(summary_data: Dict[str, Any]) -> str:
     lines.append("📊 当前 Bus Factor 分布")
     lines.append("-" * 80)
     
-    bf_0 = [r for r in repos if r.get("current_bus_factor") == 0]
-    bf_1 = [r for r in repos if r.get("current_bus_factor") == 1]
-    bf_2 = [r for r in repos if r.get("current_bus_factor") == 2]
-    bf_3_5 = [r for r in repos if 3 <= r.get("current_bus_factor", 0) <= 5]
-    bf_6plus = [r for r in repos if r.get("current_bus_factor", 0) >= 6]
+    bf_0 = [r for r in repos if r.get("weighted_avg_bus_factor") == 0]
+    bf_1 = [r for r in repos if r.get("weighted_avg_bus_factor") == 1]
+    bf_2 = [r for r in repos if r.get("weighted_avg_bus_factor") == 2]
+    bf_3_5 = [r for r in repos if 3 <= r.get("weighted_avg_bus_factor", 0) <= 5]
+    bf_6plus = [r for r in repos if r.get("weighted_avg_bus_factor", 0) >= 6]
     
     lines.append(f"\n   BF = 0 (极高风险): {len(bf_0)} 个 ({len(bf_0)/total_repos*100:.1f}%)")
     lines.append(f"   BF = 1 (极高风险): {len(bf_1)} 个 ({len(bf_1)/total_repos*100:.1f}%)")
@@ -331,7 +364,7 @@ def generate_summary_report(summary_data: Dict[str, Any]) -> str:
     for i, repo in enumerate(sorted_repos[:10], 1):
         name = repo.get("repo_name", "N/A")
         score = repo.get("total_score", 0)
-        bf = repo.get("current_bus_factor", 0)
+        bf = repo.get("weighted_avg_bus_factor", 0)
         trend = repo.get("trend_direction", "N/A")
         
         # 趋势图标

@@ -29,6 +29,28 @@ DEFAULT_WEIGHTS = {
 }
 
 
+def is_bot_account(login: str) -> bool:
+    """
+    判断是否为 Bot 账号
+    
+    Args:
+        login: 用户登录名
+    
+    Returns:
+        如果是 Bot 账号返回 True，否则返回 False
+    """
+    if not login:
+        return False
+    login_lower = login.lower()
+    return (
+        "[bot]" in login_lower or
+        login_lower.endswith("-bot") or
+        login_lower.endswith("_bot") or
+        login_lower.startswith("bot-") or
+        login_lower.startswith("bot_")
+    )
+
+
 def calculate_bus_factor(
     contributions: Dict[int, float],
     threshold: float = 0.5,
@@ -103,6 +125,7 @@ def calculate_contribution(edge_data: Dict, weights: Dict[str, float] = None) ->
 def aggregate_contributions(
     graph: nx.Graph,
     weights: Dict[str, float] = None,
+    filter_bots: bool = True,
 ) -> Dict[int, ContributorContribution]:
     """
     从图中聚合贡献量
@@ -110,6 +133,7 @@ def aggregate_contributions(
     Args:
         graph: actor-repo 图（可以是 DiGraph 或 MultiDiGraph）
         weights: 权重配置（如果为 None，使用默认权重）
+        filter_bots: 是否过滤 Bot 账号（默认 True）
     
     Returns:
         {contributor_id: ContributorContribution} 贡献量字典
@@ -140,15 +164,19 @@ def aggregate_contributions(
                 logger.warning(f"无法解析 actor_id: {source}")
                 continue
             
+            # 从节点获取登录名（用于 Bot 过滤）
+            actor_node = graph.nodes.get(source, {})
+            login = actor_node.get("login", f"actor_{actor_id}")
+            
+            # 过滤 Bot 账号
+            if filter_bots and is_bot_account(login):
+                continue  # 跳过 Bot 账号，不计算其贡献量
+            
             # 计算这条边的贡献量
             edge_contribution = calculate_contribution(edge_data, weights)
             
             # 初始化贡献者记录
             if actor_id not in contributor_contributions:
-                # 从节点获取登录名
-                actor_node = graph.nodes.get(source, {})
-                login = actor_node.get("login", f"actor_{actor_id}")
-                
                 contributor_contributions[actor_id] = {
                     "contributor_id": actor_id,
                     "login": login,
@@ -187,15 +215,19 @@ def aggregate_contributions(
                 logger.warning(f"无法解析 actor_id: {source}")
                 continue
             
+            # 从节点获取登录名（用于 Bot 过滤）
+            actor_node = graph.nodes.get(source, {})
+            login = actor_node.get("login", f"actor_{actor_id}")
+            
+            # 过滤 Bot 账号
+            if filter_bots and is_bot_account(login):
+                continue  # 跳过 Bot 账号，不计算其贡献量
+            
             # 计算这条边的贡献量
             edge_contribution = calculate_contribution(edge_data, weights)
             
             # 初始化贡献者记录
             if actor_id not in contributor_contributions:
-                # 从节点获取登录名
-                actor_node = graph.nodes.get(source, {})
-                login = actor_node.get("login", f"actor_{actor_id}")
-                
                 contributor_contributions[actor_id] = {
                     "contributor_id": actor_id,
                     "login": login,

@@ -310,10 +310,22 @@ python -m src.analysis.community_atmosphere_analyzer \
 ### 5. 运行 Bus Factor 分析
 
 ```bash
-# 分析所有项目（使用整个时间序列）
+# 分析所有项目（使用整个时间序列，自动使用多进程并行）
 python -m src.analysis.bus_factor_analyzer \
   --graphs-dir output/monthly-graphs/ \
   --output-dir output/bus-factor-analysis/
+
+# 指定并行工作进程数（推荐设置为 CPU 核心数）
+python -m src.analysis.bus_factor_analyzer \
+  --graphs-dir output/monthly-graphs/ \
+  --output-dir output/bus-factor-analysis/ \
+  --workers 4
+
+# 使用单进程模式（便于调试）
+python -m src.analysis.bus_factor_analyzer \
+  --graphs-dir output/monthly-graphs/ \
+  --output-dir output/bus-factor-analysis/ \
+  --workers 1
 
 # 单项目单月份分析（用于测试）
 python -m src.analysis.bus_factor_analyzer \
@@ -328,11 +340,13 @@ python -m src.analysis.bus_factor_analyzer \
 
 **Bus Factor 分析功能**：
 - **Bus Factor 计算**：计算达到总贡献量50%所需的最少贡献者数量
+- **Bot 账号过滤**：自动识别并过滤 Bot 账号，避免扭曲分析结果
 - **贡献量聚合**：支持可配置权重，综合考虑提交、PR、Issue、评论等贡献类型
 - **时间序列分析**：自动处理整个时间序列，为每个项目生成月度指标时间序列
 - **趋势分析**：使用线性回归计算 Bus Factor 的变化趋势
-- **综合风险评分**：基于当前值和趋势计算综合风险评分（0-100）
+- **综合风险评分**：基于当前值和趋势计算综合风险评分（0-100），使用分位数归一化提高稳健性
 - **断点续传**：支持中断后继续分析，自动跳过已处理的月份
+- **多进程并行**：支持多进程并行处理，显著提升分析速度（默认使用 CPU 核心数）
 
 ### Bus Factor 分析原理与指标说明
 
@@ -341,8 +355,9 @@ python -m src.analysis.bus_factor_analyzer \
 - **输入数据**：
   - `actor-repo` 图：开发者与仓库的贡献关系，边上包含统计信息（`commit_count`, `pr_merged`, `pr_opened`, `issue_opened`, `issue_closed`, `is_comment` 等）；
   - `output/monthly-graphs/index.json`：索引所有项目、图类型与月份对应的 `.graphml` 文件路径。
-- **逐项目、逐月份处理**：
+- **逐项目、逐月份处理**（支持多进程并行）：
   - 对每个项目，找到所有有 `actor-repo` 图的月份；
+  - **并行处理**：默认使用多进程并行处理不同项目，显著提升分析速度（可通过 `--workers` 参数控制进程数）；
   - 对每一个月份：
     1. 读取 `actor-repo` 图，遍历所有边（从 actor 到 repo 的边）；
     2. 使用权重公式聚合每个贡献者的贡献量（综合考虑提交、PR、Issue、评论等）；
@@ -421,9 +436,15 @@ python -m src.analysis.bus_factor_analyzer \
   )
   ```
 
+- **Bot 账号过滤**：
+  - 自动识别并过滤 Bot 账号（如 `[bot]`, `-bot`, `_bot`, `bot-`, `bot_` 等）；
+  - Bot 账号的贡献量不计入 Bus Factor 计算，避免扭曲分析结果；
+  - 过滤后，如果总贡献量为 0，`bus_factor` 返回 `None`。
+
 - **聚合过程**：
   - 遍历 `actor-repo` 图中所有从 actor 到 repo 的边；
-  - 对每条边，使用权重公式计算该边的贡献量；
+  - 对每条边，检查是否为 Bot 账号，如果是则跳过；
+  - 对非 Bot 账号的边，使用权重公式计算该边的贡献量；
   - 对每个贡献者，累加其所有边的贡献量，得到总贡献量。
 
 #### 算法三：时间序列分析（加权平均 Bus Factor）
@@ -431,9 +452,10 @@ python -m src.analysis.bus_factor_analyzer \
 - **加权平均计算**：
   - 不使用简单平均，而是使用**按总贡献量加权**的平均值：
     ```python
-    avg_bus_factor = Σ(bus_factor_i × total_contribution_i) / Σ(total_contribution_i)
+    weighted_avg_bus_factor = Σ(bus_factor_i × total_contribution_i) / Σ(total_contribution_i)
     ```
   - **理由**：贡献量大的月份更能反映项目的真实状况，应该给予更高权重。
+  - 这个加权平均值就是 `weighted_avg_bus_factor`，用于后续的风险评分计算。
 
 - **数据过滤**：
   - 只考虑 `bus_factor` 不为 `None` 的月份（过滤掉无有效数据的月份）；
@@ -469,19 +491,21 @@ python -m src.analysis.bus_factor_analyzer \
 #### 算法五：综合风险评分（0-100 分）
 
 - **评分组成**：
-  - **当前值得分（0-50 分）**：基于当前 Bus Factor 值（时间序列加权平均）；
+  - **当前值得分（0-50 分）**：基于 `weighted_avg_bus_factor`（时间序列加权平均 Bus Factor）；
   - **趋势得分（0-50 分）**：基于 Bus Factor 的变化趋势。
 
 - **当前值得分计算**：
   ```python
   # 归一化到 [0, 1]
-  normalized_factor = (current_bus_factor - min_bus_factor) / (max_bus_factor - min_bus_factor)
+  normalized_factor = (weighted_avg_bus_factor - min_bus_factor) / (max_bus_factor - min_bus_factor)
   normalized_factor = max(0.0, min(1.0, normalized_factor))  # 限制在 [0, 1]
   
   # 反转：Bus Factor 越小，风险越高，得分越高
   current_score = (1.0 - normalized_factor) × 50
   ```
-  - `min_bus_factor` 和 `max_bus_factor` 从所有项目的所有月份中计算（用于归一化）；
+  - `weighted_avg_bus_factor` 是基于整个时间序列的加权平均 Bus Factor（按总贡献量加权）；
+  - `min_bus_factor` 和 `max_bus_factor` 使用**5% 和 95% 分位数**计算（而非最小/最大值），对极值更稳健；
+  - 使用分位数的优势：避免单个极端项目影响所有项目的评分，更符合实际分布；
   - Bus Factor = 1 时，得分最高（50 分），表示风险最高；
   - Bus Factor 越大，得分越低，表示风险越低。
 
@@ -506,16 +530,17 @@ python -m src.analysis.bus_factor_analyzer \
   ```python
   total_score = current_score + trend_score
   
-  if total_score >= 70:
+  if total_score >= 80:
       risk_level = "高"
-  elif total_score >= 40:
+  elif total_score >= 50:
       risk_level = "中"
   else:
       risk_level = "低"
   ```
-  - **高风险（≥70 分）**：Bus Factor 很低或正在下降，项目高度依赖少数贡献者；
-  - **中风险（40-69 分）**：Bus Factor 中等或趋势稳定，需要关注；
-  - **低风险（<40 分）**：Bus Factor 较高或正在上升，项目健康。
+  - **高风险（≥80 分）**：Bus Factor 很低或正在下降，项目高度依赖少数贡献者；
+  - **中风险（50-79 分）**：Bus Factor 中等或趋势稳定，需要关注；
+  - **低风险（<50 分）**：Bus Factor 较高或正在上升，项目健康。
+  - **阈值调整说明**：从原来的 70/40 调整为 80/50，提高区分度，减少误报。
 
 #### 结果文件与示例
 
@@ -567,7 +592,7 @@ python -m src.analysis.bus_factor_analyzer \
       "current_score": 50.0,
       "trend_score": 41.67,
       "risk_level": "高",
-      "current_bus_factor": 1,
+      "weighted_avg_bus_factor": 1,
       "trend_direction": "下降"
     }
   }
@@ -587,7 +612,7 @@ python -m src.analysis.bus_factor_analyzer \
       "current_score": 50.0,
       "trend_score": 41.67,
       "risk_level": "高",
-      "current_bus_factor": 1,
+      "weighted_avg_bus_factor": 1,
       "trend_direction": "下降"
     },
     {
@@ -596,7 +621,7 @@ python -m src.analysis.bus_factor_analyzer \
       "current_score": 31.58,
       "trend_score": 25.0,
       "risk_level": "中",
-      "current_bus_factor": 8,
+      "weighted_avg_bus_factor": 8,
       "trend_direction": "稳定"
     }
   ]
@@ -928,8 +953,11 @@ python -m src.analysis.monthly_graph_builder \
 ### Bus Factor 分析
 
 ```bash
-# 完整分析（所有项目）
+# 完整分析（所有项目，自动多进程并行）
 python -m src.analysis.bus_factor_analyzer
+
+# 指定并行工作进程数
+python -m src.analysis.bus_factor_analyzer --workers 4
 
 # 单项目单月份测试
 python -m src.analysis.bus_factor_analyzer \

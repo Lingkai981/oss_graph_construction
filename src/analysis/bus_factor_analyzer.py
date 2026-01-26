@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,6 +45,35 @@ from src.utils.logger import get_logger, setup_logger
 logger = setup_logger(log_level="INFO", log_file="logs/bus_factor.log")
 
 
+def _process_single_repo_worker(args: tuple) -> Optional[Dict[str, Any]]:
+    """
+    多进程工作函数：处理单个项目的分析（模块级别函数，用于 multiprocessing）
+    
+    Args:
+        args: 元组包含 (graphs_dir, output_dir, threshold, weights, repo_name, graph_types_data, existing_repo_data, resume)
+    
+    Returns:
+        项目分析结果字典，如果失败返回 None
+    """
+    graphs_dir, output_dir, threshold, weights, repo_name, graph_types_data, existing_repo_data, resume = args
+    
+    # 在每个进程中创建独立的分析器实例
+    analyzer = BusFactorAnalyzer(
+        graphs_dir=graphs_dir,
+        output_dir=output_dir,
+        threshold=threshold,
+        weights=weights,
+    )
+    
+    # 调用单项目分析方法
+    return analyzer._analyze_single_repo(
+        repo_name,
+        graph_types_data,
+        existing_repo_data,
+        resume,
+    )
+
+
 class BusFactorAnalyzer:
     """Bus Factor 分析器"""
     
@@ -51,6 +83,7 @@ class BusFactorAnalyzer:
         output_dir: str = "output/bus-factor-analysis/",
         threshold: float = 0.5,
         weights: Dict[str, float] = None,
+        workers: int = None,
     ):
         """
         初始化 Bus Factor 分析器
@@ -60,6 +93,7 @@ class BusFactorAnalyzer:
             output_dir: 输出目录
             threshold: Bus Factor 计算阈值（默认0.5）
             weights: 贡献权重配置（如果为 None，使用默认权重）
+            workers: 并行工作进程数（None 表示使用 CPU 核心数，1 表示单进程）
         """
         self.graphs_dir = Path(graphs_dir)
         self.output_dir = Path(output_dir)
@@ -67,6 +101,7 @@ class BusFactorAnalyzer:
         
         self.threshold = threshold
         self.weights = weights if weights is not None else DEFAULT_WEIGHTS
+        self.workers = workers
         
         # 存储分析结果
         self.repo_metrics: Dict[str, List[MonthlyRiskMetrics]] = defaultdict(list)
@@ -246,12 +281,13 @@ class BusFactorAnalyzer:
             logger.error(f"加载索引文件失败: {e}")
             return {}
     
-    def analyze_all_repos(self, resume: bool = True) -> Dict[str, Any]:
+    def analyze_all_repos(self, resume: bool = True, workers: int = None) -> Dict[str, Any]:
         """
         分析所有项目的月度风险指标时间序列
         
         Args:
             resume: 是否启用断点续传
+            workers: 并行工作进程数（None 表示使用 CPU 核心数，1 表示单进程）
         
         Returns:
             分析结果字典
@@ -324,6 +360,43 @@ class BusFactorAnalyzer:
         
         logger.info(f"总月份数: {total_months}, 已处理: {processed_months_count}, 待处理: {total_months - processed_months_count}")
         
+        # 确定工作进程数
+        if workers is None:
+            workers = os.cpu_count() or 1
+        if workers < 1:
+            workers = 1
+        
+        logger.info(f"使用 {workers} 个工作进程进行并行分析")
+        
+        # 准备任务列表
+        tasks = []
+        for repo_name, graph_types_data in index.items():
+            tasks.append((
+                repo_name,
+                graph_types_data,
+                existing_results.get(repo_name, {}),
+                resume,
+            ))
+        
+        # 单进程模式（保持原有逻辑，便于调试）
+        if workers == 1:
+            return self._analyze_all_repos_sequential(index, existing_results, all_results, resume, total_months, processed_months_count)
+        
+        # 多进程模式
+        return self._analyze_all_repos_parallel(tasks, all_results, resume, total_months, processed_months_count, workers)
+    
+    def _analyze_all_repos_sequential(
+        self,
+        index: Dict[str, Any],
+        existing_results: Dict[str, Any],
+        all_results: Dict[str, Any],
+        resume: bool,
+        total_months: int,
+        processed_months_count: int,
+    ) -> Dict[str, Any]:
+        """单进程顺序分析（原有逻辑）"""
+        total_repos = len(index)
+        
         # 遍历所有项目
         for repo_idx, (repo_name, graph_types_data) in enumerate(index.items(), 1):
             # 检测格式：新格式 {graph_type: {month: path}} 或旧格式 {month: path}
@@ -348,141 +421,282 @@ class BusFactorAnalyzer:
             else:
                 existing_months = set()
             
-            # 加载所有月份的图并计算指标
-            metrics_series = []
-            if repo_name in existing_results:
-                # 恢复已存在的指标
-                # 需要将 contributors 字典转换为 ContributorContribution 对象
-                restored_metrics = []
-                for m in existing_results[repo_name].get("metrics", []):
-                    # 复制字典以避免修改原始数据
-                    m_copy = m.copy()
-                    # 如果 contributors 是字典列表，转换为 ContributorContribution 对象
-                    if "contributors" in m_copy and m_copy["contributors"]:
-                        if isinstance(m_copy["contributors"][0], dict):
-                            m_copy["contributors"] = [
-                                ContributorContribution(**c) for c in m_copy["contributors"]
-                            ]
-                    else:
-                        m_copy["contributors"] = []
-                    restored_metrics.append(MonthlyRiskMetrics(**m_copy))
-                metrics_series = restored_metrics
-                self.repo_metrics[repo_name] = metrics_series.copy()
+            # 使用单项目分析方法
+            repo_result = self._analyze_single_repo(
+                repo_name,
+                graph_types_data,
+                existing_results.get(repo_name, {}),
+                resume,
+            )
             
-            processed_count = 0
-            skipped_count = 0
-            error_count = 0
-            total_months_in_repo = len(months)
-            months_to_process = total_months_in_repo - len(existing_months)
-            
-            for month_idx, (month, graph_path) in enumerate(sorted(months.items()), 1):
-                # 跳过已处理的月份
-                if month in existing_months:
-                    skipped_count += 1
-                    continue
+            if repo_result:
+                # 更新 all_results
+                all_results[repo_name] = {
+                    "metrics": repo_result["metrics"],
+                }
+                if repo_result.get("trend"):
+                    all_results[repo_name]["trend"] = repo_result["trend"]
+                if repo_result.get("risk_score"):
+                    all_results[repo_name]["risk_score"] = repo_result["risk_score"]
                 
-                # 计算当前项目内的进度
-                current_month_in_repo = month_idx - skipped_count
-                repo_progress = (current_month_in_repo / months_to_process * 100) if months_to_process > 0 else 100
-                
-                # 计算全局进度（估算）
-                global_processed = processed_months_count + processed_count
-                global_progress = (global_processed / total_months * 100) if total_months > 0 else 0
-                
-                logger.info(f"  处理月份 [{current_month_in_repo}/{months_to_process}] ({repo_progress:.1f}%) | 全局进度: {global_processed}/{total_months} ({global_progress:.1f}%) | {month}")
-                
-                graph_path_obj = Path(graph_path)
-                if not graph_path_obj.is_absolute():
-                    # 检查路径是否已经包含 graphs_dir 作为前缀
-                    # index.json 中的路径可能是相对于项目根目录的（如 output/monthly-graphs/...）
-                    # 或者是相对于 graphs_dir 的（如 mochajs-mocha/actor-repo/...）
-                    graph_path_str = str(graph_path).replace("\\", "/")
-                    graphs_dir_str = str(self.graphs_dir).replace("\\", "/")
-                    
-                    # 标准化路径字符串以便比较
-                    if graph_path_str.startswith(graphs_dir_str + "/") or graph_path_str == graphs_dir_str:
-                        # 路径已经包含 graphs_dir 作为前缀，从项目根目录解析
-                        graph_path_obj = Path(graph_path)
-                    else:
-                        # 路径不包含 graphs_dir，从 graphs_dir 解析
-                        graph_path_obj = self.graphs_dir / graph_path
-                
-                if not graph_path_obj.exists():
-                    logger.warning(f"图文件不存在: {graph_path_obj}，跳过")
-                    error_count += 1
-                    continue
-                
-                try:
-                    logger.debug(f"开始处理: {repo_name} {month}, 图文件: {graph_path_obj}")
-                    graph = self.load_graph(str(graph_path_obj))
-                    if graph is None:
-                        logger.warning(f"无法加载图文件: {graph_path_obj}, 跳过 {repo_name} {month}")
-                        error_count += 1
-                        continue
-                    
-                    metrics = self.compute_monthly_metrics(graph, repo_name, month)
-                    if metrics:
-                        metrics_series.append(metrics)
-                        self.repo_metrics[repo_name].append(metrics)
-                        processed_count += 1
-                        processed_months_count += 1
-                        
-                        # 更新 all_results（无论 resume 是否为 True）
-                        if repo_name not in all_results:
-                            all_results[repo_name] = {"metrics": []}
-                        all_results[repo_name]["metrics"] = [m.to_dict() for m in metrics_series]
-                        
-                        # 计算更新后的全局进度
-                        updated_global_progress = (processed_months_count / total_months * 100) if total_months > 0 else 0
-                        logger.info(f"    ✓ 完成: {repo_name} {month}, Bus Factor={metrics.bus_factor} | 全局进度: {processed_months_count}/{total_months} ({updated_global_progress:.1f}%)")
-                        
-                        # 增量保存（仅在 resume=True 时保存）
-                        if resume:
-                            self._save_results_incremental(all_results)
-                    else:
-                        logger.warning(f"计算指标失败: {repo_name} {month}")
-                        error_count += 1
-                    
-                    # 释放图对象，避免内存泄漏
-                    del graph
-                except Exception as e:
-                    logger.error(f"处理 {repo_name} {month} 时出错: {e}", exc_info=True)
-                    error_count += 1
-                    continue
-            
-            if not metrics_series:
-                logger.warning(f"项目 {repo_name} 没有有效的指标数据，跳过")
-                continue
-            
-            # 按月份排序（处理 None 值）
-            metrics_series.sort(key=lambda m: m.month if m.month else "")
-            self.repo_metrics[repo_name] = metrics_series
-            
-            # 确保 all_results 包含最终排序后的指标（即使 resume=False）
-            if repo_name not in all_results:
-                all_results[repo_name] = {"metrics": []}
-            all_results[repo_name]["metrics"] = [m.to_dict() for m in metrics_series]
-            
-            # 计算项目完成进度
-            repo_progress_pct = ((processed_count + skipped_count) / total_months_in_repo * 100) if total_months_in_repo > 0 else 100
-            global_progress_pct = (processed_months_count / total_months * 100) if total_months > 0 else 0
-            
-            logger.info(f"  ✓ 项目完成 [{repo_idx}/{total_repos}] ({repo_idx/total_repos*100:.1f}%) | 处理 {processed_count} 个，跳过 {skipped_count} 个，错误 {error_count} 个")
-            logger.info(f"  全局进度: {processed_months_count}/{total_months} ({global_progress_pct:.1f}%)")
-            
-            # 项目完成后，如果启用断点续传，更新 summary.json
-            if resume:
-                try:
-                    # 计算该项目的趋势和风险评分
-                    self.compute_trend_for_repo(repo_name)
-                    self.compute_risk_score_for_repo(repo_name)
-                    # 增量更新 summary.json
-                    self._update_summary_incremental()
-                    logger.debug(f"已更新摘要: {repo_name}")
-                except Exception as e:
-                    logger.warning(f"更新摘要时出错: {repo_name}, 错误: {e}")
+                # 增量保存（仅在 resume=True 时保存）
+                if resume:
+                    self._save_results_incremental(all_results)
+                    try:
+                        self._update_summary_incremental()
+                    except Exception as e:
+                        logger.warning(f"更新摘要时出错: {repo_name}, 错误: {e}")
         
         return all_results
+    
+    def _analyze_all_repos_parallel(
+        self,
+        tasks: List[tuple],
+        all_results: Dict[str, Any],
+        resume: bool,
+        total_months: int,
+        processed_months_count: int,
+        workers: int,
+    ) -> Dict[str, Any]:
+        """多进程并行分析"""
+        
+        # 准备任务参数（添加必要的配置信息）
+        task_args = []
+        for repo_name, graph_types_data, existing_repo_data, _ in tasks:
+            task_args.append((
+                str(self.graphs_dir),
+                str(self.output_dir),
+                self.threshold,
+                self.weights,
+                repo_name,
+                graph_types_data,
+                existing_repo_data,
+                resume,
+            ))
+        
+        completed_count = 0
+        total_tasks = len(task_args)
+        
+        # 使用进程池执行任务
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            # 提交所有任务
+            futures = {
+                executor.submit(_process_single_repo_worker, args): args[4]  # args[4] 是 repo_name
+                for args in task_args
+            }
+            
+            # 收集结果
+            for future in as_completed(futures):
+                repo_name = futures[future]
+                completed_count += 1
+                
+                try:
+                    repo_result = future.result()
+                    
+                    if repo_result:
+                        # 更新 all_results
+                        all_results[repo_name] = {
+                            "metrics": repo_result["metrics"],
+                        }
+                        if repo_result.get("trend"):
+                            all_results[repo_name]["trend"] = repo_result["trend"]
+                        if repo_result.get("risk_score"):
+                            all_results[repo_name]["risk_score"] = repo_result["risk_score"]
+                        
+                        # 更新内存中的指标（用于后续的趋势和风险评分计算）
+                        metrics_series = []
+                        for m_dict in repo_result["metrics"]:
+                            m_copy = m_dict.copy()
+                            if "contributors" in m_copy and m_copy["contributors"]:
+                                if isinstance(m_copy["contributors"][0], dict):
+                                    m_copy["contributors"] = [
+                                        ContributorContribution(**c) for c in m_copy["contributors"]
+                                    ]
+                            else:
+                                m_copy["contributors"] = []
+                            metrics_series.append(MonthlyRiskMetrics(**m_copy))
+                        
+                        self.repo_metrics[repo_name] = metrics_series
+                        
+                        # 如果子进程已经计算了趋势和风险评分，恢复它们
+                        if repo_result.get("trend"):
+                            from src.models.bus_factor import TrendAnalysis
+                            trend_dict = repo_result["trend"]
+                            trend_analysis = TrendAnalysis(
+                                repo_name=repo_name,
+                                bus_factor_trend=trend_dict.get("bus_factor_trend", {}),
+                                months=trend_dict.get("months", []),
+                                bus_factor_values=trend_dict.get("bus_factor_values", []),
+                            )
+                            self.trends[repo_name] = trend_analysis
+                        
+                        if repo_result.get("risk_score"):
+                            from src.models.bus_factor import RiskScore
+                            risk_dict = repo_result["risk_score"]
+                            risk_score = RiskScore(
+                                repo_name=repo_name,
+                                total_score=risk_dict.get("total_score", 0.0),
+                                current_score=risk_dict.get("current_score", 0.0),
+                                trend_score=risk_dict.get("trend_score", 0.0),
+                                risk_level=risk_dict.get("risk_level", "低"),
+                                weighted_avg_bus_factor=risk_dict.get("weighted_avg_bus_factor", 0),
+                                trend_direction=risk_dict.get("trend_direction", "稳定"),
+                            )
+                            self.risk_scores[repo_name] = risk_score
+                        
+                        logger.info(f"✓ 完成 [{completed_count}/{total_tasks}]: {repo_name}")
+                    else:
+                        logger.warning(f"✗ 失败 [{completed_count}/{total_tasks}]: {repo_name} (无有效数据)")
+                    
+                        # 增量保存（仅在 resume=True 时保存）
+                        # 注意：多进程模式下，每个进程独立保存，可能会有轻微的写入冲突
+                        # 但由于使用原子写入（临时文件+重命名），影响较小
+                        if resume:
+                            try:
+                                self._save_results_incremental(all_results)
+                                self._update_summary_incremental()
+                            except Exception as e:
+                                logger.warning(f"保存结果时出错: {e}")
+                
+                except Exception as e:
+                    logger.error(f"处理 {repo_name} 时出错: {e}", exc_info=True)
+        
+        return all_results
+    
+    def _analyze_single_repo(
+        self,
+        repo_name: str,
+        graph_types_data: Dict[str, Any],
+        existing_repo_data: Dict[str, Any],
+        resume: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        分析单个项目的月度风险指标时间序列（内部方法，用于多进程）
+        
+        Args:
+            repo_name: 项目名称
+            graph_types_data: 图类型数据（从 index.json）
+            existing_repo_data: 已存在的项目数据（用于断点续传）
+            resume: 是否启用断点续传
+        
+        Returns:
+            项目分析结果字典
+        """
+        # 检测格式：新格式 {graph_type: {month: path}} 或旧格式 {month: path}
+        first_value = next(iter(graph_types_data.values()), {})
+        if isinstance(first_value, dict) and not first_value.get("node_type"):
+            # 新格式，取 actor-repo 类型
+            months = graph_types_data.get("actor-repo", {})
+        else:
+            # 旧格式
+            months = graph_types_data
+        
+        if not months:
+            logger.warning(f"项目 {repo_name} 没有月份数据，跳过")
+            return None
+        
+        # 检查是否已处理过
+        existing_months = set()
+        if existing_repo_data:
+            existing_months = {m["month"] for m in existing_repo_data.get("metrics", [])}
+        
+        # 恢复已存在的指标
+        metrics_series = []
+        if existing_repo_data:
+            restored_metrics = []
+            for m in existing_repo_data.get("metrics", []):
+                m_copy = m.copy()
+                if "contributors" in m_copy and m_copy["contributors"]:
+                    if isinstance(m_copy["contributors"][0], dict):
+                        m_copy["contributors"] = [
+                            ContributorContribution(**c) for c in m_copy["contributors"]
+                        ]
+                else:
+                    m_copy["contributors"] = []
+                restored_metrics.append(MonthlyRiskMetrics(**m_copy))
+            metrics_series = restored_metrics
+        
+        processed_count = 0
+        skipped_count = 0
+        error_count = 0
+        total_months_in_repo = len(months)
+        months_to_process = total_months_in_repo - len(existing_months)
+        
+        for month_idx, (month, graph_path) in enumerate(sorted(months.items()), 1):
+            # 跳过已处理的月份
+            if month in existing_months:
+                skipped_count += 1
+                continue
+            
+            # 计算当前项目内的进度
+            current_month_in_repo = month_idx - skipped_count
+            repo_progress = (current_month_in_repo / months_to_process * 100) if months_to_process > 0 else 100
+            
+            logger.info(f"  [{repo_name}] 处理月份 [{current_month_in_repo}/{months_to_process}] ({repo_progress:.1f}%) | {month}")
+            
+            graph_path_obj = Path(graph_path)
+            if not graph_path_obj.is_absolute():
+                graph_path_str = str(graph_path).replace("\\", "/")
+                graphs_dir_str = str(self.graphs_dir).replace("\\", "/")
+                
+                if graph_path_str.startswith(graphs_dir_str + "/") or graph_path_str == graphs_dir_str:
+                    graph_path_obj = Path(graph_path)
+                else:
+                    graph_path_obj = self.graphs_dir / graph_path
+            
+            if not graph_path_obj.exists():
+                logger.warning(f"图文件不存在: {graph_path_obj}，跳过")
+                error_count += 1
+                continue
+            
+            try:
+                logger.debug(f"开始处理: {repo_name} {month}, 图文件: {graph_path_obj}")
+                graph = self.load_graph(str(graph_path_obj))
+                if graph is None:
+                    logger.warning(f"无法加载图文件: {graph_path_obj}, 跳过 {repo_name} {month}")
+                    error_count += 1
+                    continue
+                
+                metrics = self.compute_monthly_metrics(graph, repo_name, month)
+                if metrics:
+                    metrics_series.append(metrics)
+                    processed_count += 1
+                    logger.info(f"    ✓ 完成: {repo_name} {month}, Bus Factor={metrics.bus_factor}")
+                else:
+                    logger.warning(f"计算指标失败: {repo_name} {month}")
+                    error_count += 1
+                
+                # 释放图对象，避免内存泄漏
+                del graph
+            except Exception as e:
+                logger.error(f"处理 {repo_name} {month} 时出错: {e}", exc_info=True)
+                error_count += 1
+                continue
+        
+        if not metrics_series:
+            logger.warning(f"项目 {repo_name} 没有有效的指标数据，跳过")
+            return None
+        
+        # 按月份排序（处理 None 值）
+        metrics_series.sort(key=lambda m: m.month if m.month else "")
+        
+        # 计算该项目的趋势和风险评分（如果启用断点续传）
+        if resume:
+            try:
+                self.repo_metrics[repo_name] = metrics_series
+                self.compute_trend_for_repo(repo_name)
+                self.compute_risk_score_for_repo(repo_name)
+            except Exception as e:
+                logger.warning(f"计算趋势和风险评分时出错: {repo_name}, 错误: {e}")
+        
+        logger.info(f"  ✓ 项目完成: {repo_name} | 处理 {processed_count} 个，跳过 {skipped_count} 个，错误 {error_count} 个")
+        
+        return {
+            "repo_name": repo_name,
+            "metrics": [m.to_dict() for m in metrics_series],
+            "trend": self.trends.get(repo_name).to_dict() if repo_name in self.trends else None,
+            "risk_score": self.risk_scores.get(repo_name).to_dict() if repo_name in self.risk_scores else None,
+        }
     
     def _save_results_incremental(self, results: Dict[str, Any]) -> None:
         """增量保存结果（内部方法）- 使用原子写入防止文件损坏"""
@@ -567,13 +781,13 @@ class BusFactorAnalyzer:
             raise
     
     @staticmethod
-    def calculate_trend(values: List[float], threshold: float = 0.1) -> Dict[str, Any]:
+    def calculate_trend(values: List[float], threshold: float = 5.0) -> Dict[str, Any]:
         """
-        计算时间序列趋势（使用线性回归）
+        计算时间序列趋势（使用线性回归和变化率）
         
         Args:
             values: 时间序列值列表（按时间顺序）
-            threshold: 判断"稳定"的斜率阈值
+            threshold: 判断"稳定"的变化率阈值（百分比，默认5%）
         
         Returns:
             趋势分析字典
@@ -586,12 +800,12 @@ class BusFactorAnalyzer:
                 "values": values,
             }
         
-        # 使用线性回归计算斜率
+        # 使用线性回归计算斜率（用于参考）
         n = len(values)
         x = np.arange(n)
         slope = np.polyfit(x, values, 1)[0]
         
-        # 计算变化率
+        # 计算变化率（首尾值的相对变化百分比）
         first_value = values[0]
         last_value = values[-1]
         if math.isclose(first_value, 0.0, abs_tol=1e-9):
@@ -599,13 +813,21 @@ class BusFactorAnalyzer:
         else:
             change_rate = ((last_value - first_value) / first_value) * 100
         
-        # 判断趋势方向
-        if abs(slope) < threshold:
+        # 判断趋势方向（统一使用变化率，与得分计算保持一致）
+        if abs(change_rate) < threshold:
             direction = "稳定"
-        elif slope > 0:
+        elif change_rate > 0:
             direction = "上升"
         else:
             direction = "下降"
+        
+        # 一致性检查：如果斜率与变化率方向不一致，记录警告
+        slope_direction = "上升" if slope > 0 else ("下降" if slope < 0 else "稳定")
+        if direction != slope_direction and abs(change_rate) >= threshold:
+            logger.debug(
+                f"趋势方向不一致: 斜率方向={slope_direction} (slope={slope:.3f}), "
+                f"变化率方向={direction} (change_rate={change_rate:.2f}%)"
+            )
         
         return {
             "direction": direction,
@@ -682,7 +904,7 @@ class BusFactorAnalyzer:
     
     @staticmethod
     def calculate_risk_score(
-        current_bus_factor: int,
+        weighted_avg_bus_factor: int,
         trend_direction: str,
         trend_change_rate: float,
         min_bus_factor: float = 1.0,
@@ -692,7 +914,7 @@ class BusFactorAnalyzer:
         计算综合风险评分（0-100，分数越高风险越高）
         
         Args:
-            current_bus_factor: 当前 Bus Factor 值（基于整个时间序列的加权平均值）
+            weighted_avg_bus_factor: Bus Factor 加权平均值（基于整个时间序列，按总贡献量加权）
             trend_direction: 趋势方向（"上升" | "下降" | "稳定" | "数据不足"）
             trend_change_rate: 变化率（百分比）
             min_bus_factor: 最小 Bus Factor 值（用于归一化，基于所有项目的所有月份）
@@ -702,28 +924,31 @@ class BusFactorAnalyzer:
             风险评分字典
         """
         # 当前值得分（0-50）：Bus Factor 越小，风险越高
-        normalized_factor = (current_bus_factor - min_bus_factor) / (max_bus_factor - min_bus_factor)
+        normalized_factor = (weighted_avg_bus_factor - min_bus_factor) / (max_bus_factor - min_bus_factor)
         normalized_factor = max(0.0, min(1.0, normalized_factor))  # 限制在 [0, 1]
         current_score = (1.0 - normalized_factor) * 50  # 反转：值越小得分越高
         
-        # 趋势得分（0-50）：上升趋势风险高，下降趋势风险低
+        # 趋势得分（0-50）：基于 Bus Factor 的变化趋势
+        # Bus Factor 上升是好事（风险降低），下降是坏事（风险增加）
         if trend_direction == "数据不足":
             trend_score = 25.0  # 数据不足时给中等分数
         elif trend_direction == "上升":
-            # Bus Factor 上升是好事（风险降低），所以趋势得分应该降低
-            trend_score = max(0.0, 25.0 - abs(trend_change_rate) * 0.2)
+            # Bus Factor 上升是好事（风险降低），趋势得分应该降低
+            # 使用变化率（已经是正数），变化率越大，得分越低
+            trend_score = max(0.0, 25.0 - trend_change_rate * 0.2)
         elif trend_direction == "下降":
-            # Bus Factor 下降是坏事（风险增加），所以趋势得分应该增加
+            # Bus Factor 下降是坏事（风险增加），趋势得分应该增加
+            # 使用绝对值，变化率越大（绝对值），得分越高
             trend_score = min(50.0, 25.0 + abs(trend_change_rate) * 0.2)
         else:  # 稳定
-            trend_score = 25.0
+            trend_score = 25.0  # 基准分数
         
         total_score = current_score + trend_score
         
-        # 确定风险等级
-        if total_score >= 70:
+        # 确定风险等级（调整阈值：高风险从70提高到80，中风险从40提高到50）
+        if total_score >= 80:
             risk_level = "高"
-        elif total_score >= 40:
+        elif total_score >= 50:
             risk_level = "中"
         else:
             risk_level = "低"
@@ -763,14 +988,19 @@ class BusFactorAnalyzer:
         if repo_name not in self.trends:
             self.compute_trend_for_repo(repo_name)
         
-        # 如果没有提供范围，从所有已分析的项目中计算
+        # 如果没有提供范围，从所有已分析的项目中计算（使用分位数）
         if min_bus_factor is None or max_bus_factor is None:
             all_bus_factors = []
             for ms in self.repo_metrics.values():
                 # 过滤 None 值
                 all_bus_factors.extend([m.bus_factor for m in ms if m.bus_factor is not None])
-            min_bus_factor = min(all_bus_factors) if all_bus_factors else 1.0
-            max_bus_factor = max(all_bus_factors) if all_bus_factors else 50.0
+            if all_bus_factors:
+                # 使用 5% 和 95% 分位数，对极值更稳健
+                min_bus_factor = float(np.percentile(all_bus_factors, 5))
+                max_bus_factor = float(np.percentile(all_bus_factors, 95))
+            else:
+                min_bus_factor = 1.0
+                max_bus_factor = 50.0
         
         # 改进：使用整个时间序列的加权平均 Bus Factor（按总贡献量加权）
         # 先过滤掉 bus_factor 为 None 的指标
@@ -796,7 +1026,7 @@ class BusFactorAnalyzer:
             avg_bus_factor = sum(m.bus_factor for m in sorted_metrics) / len(sorted_metrics)
         
         # 转换为整数（四舍五入）
-        current_bus_factor = int(round(avg_bus_factor))
+        weighted_avg_bus_factor = int(round(avg_bus_factor))
         
         # 获取趋势信息（基于整个时间序列）
         if repo_name in self.trends:
@@ -809,7 +1039,7 @@ class BusFactorAnalyzer:
         
         # 计算风险评分
         score_dict = self.calculate_risk_score(
-            current_bus_factor,
+            weighted_avg_bus_factor,
             trend_direction,
             trend_change_rate,
             min_bus_factor,
@@ -822,7 +1052,7 @@ class BusFactorAnalyzer:
             current_score=score_dict["current_score"],
             trend_score=score_dict["trend_score"],
             risk_level=score_dict["risk_level"],
-            current_bus_factor=current_bus_factor,
+            weighted_avg_bus_factor=weighted_avg_bus_factor,
             trend_direction=trend_direction,
         )
         self.risk_scores[repo_name] = risk_score
@@ -841,7 +1071,7 @@ class BusFactorAnalyzer:
         if not self.trends:
             self.compute_trends()
         
-        # 找到所有 Bus Factor 值的范围（用于归一化）
+        # 找到所有 Bus Factor 值的范围（用于归一化）- 使用分位数（5% 和 95%）更稳健
         all_bus_factors = []
         for metrics_series in self.repo_metrics.values():
             # --- 修复点：添加 if m.bus_factor is not None ---
@@ -851,8 +1081,10 @@ class BusFactorAnalyzer:
         if not all_bus_factors:
             min_bus_factor, max_bus_factor = 1.0, 50.0
         else:
-            min_bus_factor = min(all_bus_factors)
-            max_bus_factor = max(all_bus_factors)
+            # 使用 5% 和 95% 分位数，对极值更稳健
+            min_bus_factor = float(np.percentile(all_bus_factors, 5))
+            max_bus_factor = float(np.percentile(all_bus_factors, 95))
+            logger.debug(f"归一化范围: 5%分位数={min_bus_factor:.2f}, 95%分位数={max_bus_factor:.2f}, 实际范围=[{min(all_bus_factors)}, {max(all_bus_factors)}]")
         
         for repo_name, metrics_series in self.repo_metrics.items():
             if not metrics_series:
@@ -881,8 +1113,9 @@ class BusFactorAnalyzer:
         if not all_bus_factors:
             min_bus_factor, max_bus_factor = 1.0, 50.0
         else:
-            min_bus_factor = min(all_bus_factors)
-            max_bus_factor = max(all_bus_factors)
+            # 使用 5% 和 95% 分位数，对极值更稳健
+            min_bus_factor = float(np.percentile(all_bus_factors, 5))
+            max_bus_factor = float(np.percentile(all_bus_factors, 95))
         
         # 为所有已分析的项目计算风险评分
         for repo_name in self.repo_metrics.keys():
@@ -987,7 +1220,7 @@ class BusFactorAnalyzer:
                 f"{i:2d}. {repo_name:30s} "
                 f"评分={score.total_score:5.1f} "
                 f"等级={score.risk_level:4s} "
-                f"Bus Factor={score.current_bus_factor:3d}"
+                f"Bus Factor={score.weighted_avg_bus_factor:3d}"
             )
         print("=" * 60)
     
@@ -1006,7 +1239,7 @@ class BusFactorAnalyzer:
         logger.info("=" * 60)
         
         # 1. 分析所有项目的时间序列
-        results = self.analyze_all_repos(resume=resume)
+        results = self.analyze_all_repos(resume=resume, workers=getattr(self, 'workers', None))
         
         if not results:
             logger.warning("没有分析结果")
@@ -1078,6 +1311,12 @@ if __name__ == "__main__":
         action="store_true",
         help="禁用断点续传",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="并行工作进程数（默认使用 CPU 核心数，设置为 1 使用单进程）",
+    )
     
     args = parser.parse_args()
     
@@ -1097,6 +1336,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         threshold=args.threshold,
         weights=weights,
+        workers=args.workers,
     )
     
     # 单项目单月份分析模式（用于测试）
