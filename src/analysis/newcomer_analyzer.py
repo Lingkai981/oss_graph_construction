@@ -49,6 +49,14 @@ class MonthlyCore:
     core_actor_ids: List[int] = field(default_factory=list)  # numeric actor_id
     core_logins: List[str] = field(default_factory=list)     # login strings
 
+@dataclass
+class PreparedMonth:
+    month: str
+    path: str
+    graph: nx.MultiDiGraph
+    g_simple: nx.Graph
+    core_node_ids: List[str]
+    actor_nodes: List[str]  # 当月 Actor 节点（用于 reachability）
 
 @dataclass
 class NewcomerDistanceRecord:
@@ -373,6 +381,39 @@ class NewcomerAnalyzer:
 
         return {}
 
+    def prepare_monthly_data(
+        self,
+        repo_name: str,
+        month_to_graph_path: Dict[str, str],
+    ) -> List[PreparedMonth]:
+        """
+        每个 repo：对每个月份图只做一次 IO + 一次预计算（无向图、core、actor_nodes）
+        """
+        prepared: List[PreparedMonth] = []
+        for month in sorted(month_to_graph_path.keys()):
+            path = month_to_graph_path[month]
+            graph = self.load_graph(path)
+            if graph is None or graph.number_of_nodes() == 0:
+                continue
+
+            # 只做一次
+            core_node_ids, _, _ = self.identify_core_members(graph)
+            g_simple = _to_undirected_simple(graph)
+            actor_nodes = [
+                n for n, a in graph.nodes(data=True)
+                if str(a.get("node_type", "Actor")) == "Actor"
+            ]
+
+            prepared.append(PreparedMonth(
+                month=month,
+                path=path,
+                graph=graph,
+                g_simple=g_simple,
+                core_node_ids=core_node_ids,
+                actor_nodes=actor_nodes,
+            ))
+        return prepared
+
     # ---------- 核心成员识别（沿用原算法） ----------
 
     def identify_core_members(self, graph: nx.MultiDiGraph) -> Tuple[List[str], List[int], List[str]]:
@@ -466,7 +507,7 @@ class NewcomerAnalyzer:
     def compute_newcomer_distances_for_repo(
         self,
         repo_name: str,
-        month_to_graph_path: Dict[str, str],
+        prepared_months: List[PreparedMonth],
     ) -> Tuple[List[NewcomerDistanceRecord], List[Dict[str, Any]]]:
         """
         返回：
@@ -478,13 +519,14 @@ class NewcomerAnalyzer:
 
         first_seen: Dict[str, str] = {}  # node_id -> first month
 
-        for month in sorted(month_to_graph_path.keys()):
-            graph = self.load_graph(month_to_graph_path[month])
+        for pm in prepared_months:
+            month = pm.month
+            graph = pm.graph
             if graph is None or graph.number_of_nodes() == 0:
                 continue
 
-            core_node_ids, _, _ = self.identify_core_members(graph)
-            g_simple = _to_undirected_simple(graph)
+            core_node_ids = pm.core_node_ids
+            g_simple = pm.g_simple
 
             newcomers_this_month: List[NewcomerDistanceRecord] = []
             for node_id, attr in graph.nodes(data=True):
@@ -553,7 +595,7 @@ class NewcomerAnalyzer:
     def compute_periphery_to_core_for_repo(
         self,
         repo_name: str,
-        month_to_graph_path: Dict[str, str],
+        prepared_months: List[PreparedMonth],
     ) -> Tuple[List[PeripheryToCoreRecord], Optional[float], List[Dict[str, Any]]]:
         """
         对“曾经成为核心成员”的 actor，计算其：
@@ -566,13 +608,15 @@ class NewcomerAnalyzer:
         first_core: Dict[str, str] = {}
         actor_info: Dict[str, Tuple[int, str]] = {}
 
-        months_sorted = sorted(month_to_graph_path.keys())
+        months_sorted = [pm.month for pm in prepared_months]
         if not months_sorted:
             return [], None, []
         first_month = months_sorted[0]
 
-        for month in months_sorted:
-            graph = self.load_graph(month_to_graph_path[month])
+        for pm in prepared_months:
+            graph = pm.graph 
+            month = pm.month
+            
             if graph is None or graph.number_of_nodes() == 0:
                 continue
 
@@ -584,7 +628,7 @@ class NewcomerAnalyzer:
                 if node_id not in actor_info:
                     actor_info[node_id] = (_parse_actor_id(attr.get("actor_id", 0)), str(attr.get("login", node_id)))
 
-            core_node_ids, _, _ = self.identify_core_members(graph)
+            core_node_ids = pm.core_node_ids
             for c in core_node_ids:
                 if c not in first_core:
                     first_core[c] = month
@@ -646,7 +690,7 @@ class NewcomerAnalyzer:
     def compute_core_reachability_for_repo(
         self,
         repo_name: str,
-        month_to_graph_path: Dict[str, str],
+        prepared_months: List[PreparedMonth],
     ) -> Tuple[List[CoreReachabilityMonthlySummary], Dict[str, Any]]:
         """
         统计“非核心成员到核心成员”的不可达情况（按月 + 全局汇总）
@@ -666,16 +710,17 @@ class NewcomerAnalyzer:
         total_unreach_all = 0
         total_unreach_any = 0
 
-        for month in sorted(month_to_graph_path.keys()):
-            graph = self.load_graph(month_to_graph_path[month])
+        for pm in prepared_months:
+            graph = pm.graph
+            month = pm.month
             if graph is None or graph.number_of_nodes() == 0:
                 continue
 
             # 当月 Actor 总数（分母）
-            actor_nodes = [n for n, a in graph.nodes(data=True) if str(a.get("node_type", "Actor")) == "Actor"]
+            actor_nodes = pm.actor_nodes
             total_actor_count = len(actor_nodes)
 
-            core_node_ids, _, _ = self.identify_core_members(graph)
+            core_node_ids = pm.core_node_ids
             core_targets = list(core_node_ids)
             total_core = len(core_targets)
 
@@ -694,7 +739,7 @@ class NewcomerAnalyzer:
                 continue
 
             core_set = set(core_targets)
-            g_simple = _to_undirected_simple(graph)
+            g_simple = pm.g_simple
 
             non_core_nodes = [n for n in actor_nodes if n not in core_set]
 
@@ -755,9 +800,14 @@ class NewcomerAnalyzer:
 
             logger.info(f"[{repo_idx}/{total_repos}] 分析: {repo_name} ({len(months)} 个月)")
 
-            newcomer_records, newcomer_monthly = self.compute_newcomer_distances_for_repo(repo_name, months)
-            periphery_records, avg_months_to_core, p2c_monthly = self.compute_periphery_to_core_for_repo(repo_name, months)
-            reach_monthly, reach_overall = self.compute_core_reachability_for_repo(repo_name, months)
+            prepared_months = self.prepare_monthly_data(repo_name, months)
+            if not prepared_months:
+                continue
+
+            newcomer_records, newcomer_monthly = self.compute_newcomer_distances_for_repo(repo_name, prepared_months)
+            periphery_records, avg_months_to_core, p2c_monthly = self.compute_periphery_to_core_for_repo(repo_name, prepared_months)
+            reach_monthly, reach_overall = self.compute_core_reachability_for_repo(repo_name, prepared_months)
+
 
             # overall newcomer avg（只对有值的）
             newcomer_vals = [r.avg_shortest_path_to_core for r in newcomer_records if r.avg_shortest_path_to_core is not None]
