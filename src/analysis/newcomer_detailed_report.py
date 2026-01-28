@@ -147,13 +147,13 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append(f"⭐ 总得分（四项三层总分之和）: {_fmt(total_score, ndigits=4)}")
     lines.append(f"{icon} 预警等级: {level}")
 
-    issues = flagged_issues(repo_data, threshold=15.0)
+    issues = flagged_issues(repo_data, threshold=10.0)
     if issues:
-        lines.append("⚠️ 单项异常说明（单项得分 > 15）:")
+        lines.append("⚠️ 单项异常说明（单项得分 > 10）:")
         for _, score, msg in issues:
             lines.append(f"   - {msg}（得分: {_fmt(score, ndigits=4)}）")
     else:
-        lines.append("✅ 单项异常说明: 无（所有单项得分 ≤ 15）")
+        lines.append("✅ 单项异常说明: 无（所有单项得分 ≤ 10）")
 
     # ---- 概览 ----
     overall_dist = newcomer.get("overall_avg_shortest_path_to_core")

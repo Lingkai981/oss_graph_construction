@@ -503,7 +503,14 @@ class BurnoutAnalyzer:
         - 协作密度 (0-25分)
         """
         if len(metrics_series) < 2:
-            return {"score": 0, "level": "unknown", "factors": {}}
+            return {
+                "score": 0,
+                "level": "unknown",
+                "factors": {},
+                "months_analyzed": len(metrics_series),
+                "period": None,
+                "analysis_method": "three_layer",
+            }
         
         sorted_metrics = sorted(metrics_series, key=lambda m: m.month)
         n = len(sorted_metrics)
