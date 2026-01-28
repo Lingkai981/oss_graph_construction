@@ -28,6 +28,34 @@ from src.utils.logger import get_logger
 
 logger = get_logger()
 
+# ==================== 边权重配置 ====================
+
+# 默认权重配置（可在配置文件中自定义）
+# 权重反映不同类型贡献的价值，用于核心成员识别中的加权度数计算
+#
+# 权重设计原则：
+# 1. PR_MERGE (3.0): 最高权重，合并 PR 是核心维护者的关键职责
+# 2. PR_REVIEW (1.5): 中等权重，代码审查体现技术贡献和协作
+# 3. ISSUE_INTERACTION (0.5): 较低权重，Issue 评论主要是参与讨论
+# 4. ISSUE_CO_PARTICIPANT (0.5): 较低权重，共同参与体现社区参与度
+#
+# 权重合理性评估：
+# - PR_MERGE 从 5.0 降至 3.0 是合理的：
+#   * 3.0 仍然是最高权重，体现其重要性
+#   * 避免过度依赖单一指标（PR 合并）
+#   * 与其他权重（1.5, 0.5）的比例更均衡
+# - 权重比例：3.0 : 1.5 : 0.5 = 6 : 3 : 1，体现了清晰的贡献价值层次
+EDGE_WEIGHTS = {
+    # Actor-Actor 图边类型权重
+    "PR_MERGE": 3.0,              # 合并的 PR（高价值贡献）
+    "PR_REVIEW": 1.5,             # PR 代码审查（中等价值）
+    "ISSUE_INTERACTION": 0.5,     # Issue 评论（参与度）
+    "ISSUE_CO_PARTICIPANT": 0.5,  # 共同参与 Issue（参与度）
+    
+    # 默认权重（如果边类型未在配置中）
+    "default": 1.0,
+}
+
 
 @dataclass
 class MonthlyMetrics:
@@ -38,7 +66,7 @@ class MonthlyMetrics:
     # 基础网络指标
     node_count: int = 0
     edge_count: int = 0
-    density: float = 0.0
+    clustering_coefficient: float = 0.0  # 平均聚类系数（替代密度）
     
     # 活跃度指标
     total_events: int = 0
@@ -68,7 +96,7 @@ class MonthlyMetrics:
             "repo_name": self.repo_name,
             "node_count": self.node_count,
             "edge_count": self.edge_count,
-            "density": self.density,
+            "clustering_coefficient": self.clustering_coefficient,
             "total_events": self.total_events,
             "unique_actors": self.unique_actors,
             "core_actors": self.core_actors,
@@ -120,7 +148,28 @@ class BurnoutAnalyzer:
     def load_graph(self, graph_path: str) -> Optional[nx.MultiDiGraph]:
         """加载图"""
         try:
-            return nx.read_graphml(graph_path)
+            graph = nx.read_graphml(graph_path)
+            # 确保返回 MultiDiGraph
+            if isinstance(graph, nx.MultiDiGraph):
+                return graph
+            elif isinstance(graph, nx.DiGraph):
+                # 转换为 MultiDiGraph
+                multi_graph = nx.MultiDiGraph()
+                multi_graph.add_nodes_from(graph.nodes(data=True))
+                multi_graph.add_edges_from(graph.edges(data=True))
+                multi_graph.graph.update(graph.graph)
+                return multi_graph
+            elif isinstance(graph, (nx.Graph, nx.MultiGraph)):
+                # 如果是无向图，先转为有向图再转为 MultiDiGraph
+                di_graph = graph.to_directed()
+                multi_graph = nx.MultiDiGraph()
+                multi_graph.add_nodes_from(di_graph.nodes(data=True))
+                multi_graph.add_edges_from(di_graph.edges(data=True))
+                multi_graph.graph.update(di_graph.graph)
+                return multi_graph
+            else:
+                logger.warning(f"未知的图类型: {type(graph)}, 路径: {graph_path}")
+                return None
         except Exception as e:
             logger.warning(f"加载图失败: {graph_path}, 错误: {e}")
             return None
@@ -138,9 +187,25 @@ class BurnoutAnalyzer:
         metrics.node_count = graph.number_of_nodes()
         metrics.edge_count = graph.number_of_edges()
         
-        if metrics.node_count > 1:
-            max_edges = metrics.node_count * (metrics.node_count - 1)
-            metrics.density = metrics.edge_count / max_edges if max_edges > 0 else 0
+        # 计算平均聚类系数（替代密度）
+        if metrics.node_count > 2:
+            try:
+                # 转为无向图并合并多重边（使用 nx.Graph 会自动合并）
+                # 先转为无向图，再创建普通 Graph 以合并多重边
+                undirected_multi = graph.to_undirected()
+                # 创建普通 Graph，会自动合并多重边
+                undirected = nx.Graph(undirected_multi)
+                clustering = nx.clustering(undirected)
+                if clustering:
+                    metrics.clustering_coefficient = sum(clustering.values()) / len(clustering)
+                else:
+                    metrics.clustering_coefficient = 0.0
+            except Exception as e:
+                logger.warning(f"计算聚类系数失败: {repo_name}/{month}, 错误: {e}")
+                metrics.clustering_coefficient = 0.0
+        else:
+            # 节点数 <= 2 时，无法计算有意义的聚类系数
+            metrics.clustering_coefficient = 0.0
         
         # 从图元数据获取
         metrics.total_events = graph.graph.get("total_events", 0)
@@ -160,11 +225,44 @@ class BurnoutAnalyzer:
                     variance = sum((d - metrics.degree_mean) ** 2 for d in degree_values) / len(degree_values)
                     metrics.degree_std = math.sqrt(variance)
                 
-                # ========== 智能核心成员识别（多信号融合）==========
+                # ========== 智能核心成员识别（多信号融合 + 边权重）==========
                 total_actors = len(degrees)
-                total_degree = sum(degree_values)
                 
-                # 1. 计算 k-core 分解（网络结构核心）
+                # 1. 计算加权度数（考虑边类型权重）
+                weighted_degrees = {}
+                is_multigraph = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+                
+                for node_id in graph.nodes():
+                    weighted_degree = 0.0
+                    # 遍历节点的所有出边
+                    if is_multigraph:
+                        for _, _, key, data in graph.out_edges(node_id, keys=True, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    else:
+                        for _, _, data in graph.out_edges(node_id, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    # 遍历节点的所有入边
+                    if is_multigraph:
+                        for _, _, key, data in graph.in_edges(node_id, keys=True, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    else:
+                        for _, _, data in graph.in_edges(node_id, data=True):
+                            edge_type = data.get("edge_type", "default")
+                            weight = EDGE_WEIGHTS.get(edge_type, EDGE_WEIGHTS["default"])
+                            weighted_degree += weight
+                    weighted_degrees[node_id] = weighted_degree
+                
+                weighted_degree_values = list(weighted_degrees.values())
+                total_weighted_degree = sum(weighted_degree_values)
+                max_weighted_degree = max(weighted_degree_values) if weighted_degree_values else 1
+                
+                # 2. 计算 k-core 分解（网络结构核心）
                 try:
                     # 转换为无向图进行 k-core 分解
                     undirected = graph.to_undirected()
@@ -174,21 +272,23 @@ class BurnoutAnalyzer:
                     core_numbers = {n: 1 for n in graph.nodes()}
                     max_k = 1
                 
-                # 2. 计算综合得分：贡献量（60%）+ 网络位置（40%）
+                # 3. 计算综合得分：加权贡献量（50%）+ 网络位置（50%）
                 actor_scores = {}
                 for node_id in graph.nodes():
-                    degree = degrees.get(node_id, 0)
+                    weighted_degree = weighted_degrees.get(node_id, 0.0)
+                    raw_degree = degrees.get(node_id, 0)  # 保留原始度数为兼容性
                     kcore = core_numbers.get(node_id, 0)
                     
                     # 归一化
-                    degree_norm = degree / max(metrics.degree_max, 1)
+                    weighted_degree_norm = weighted_degree / max(max_weighted_degree, 1)
                     kcore_norm = kcore / max(max_k, 1)
                     
-                    # 综合得分
-                    score = 0.6 * degree_norm + 0.4 * kcore_norm
+                    # 综合得分（使用加权度数）
+                    score = 0.5 * weighted_degree_norm + 0.5 * kcore_norm
                     actor_scores[node_id] = {
                         "score": score,
-                        "degree": degree,
+                        "weighted_degree": weighted_degree,
+                        "degree": raw_degree,  # 保留原始度数
                         "kcore": kcore,
                     }
                 
@@ -199,39 +299,36 @@ class BurnoutAnalyzer:
                     reverse=True
                 )
                 
-                # 4. 动态确定核心成员数量（三重约束）
-                #    - 贡献阈值：累计贡献 >= 70%
-                #    - 人数上限：最多 30% 的人
-                #    - 得分阈值：得分 >= 平均得分
-                contribution_threshold = total_degree * 0.7
-                max_core_count = max(3, int(total_actors * 0.3))
+                # 4. 动态确定核心成员数量（双重约束）
+                #    - 贡献阈值：累计加权贡献 >= 50%
+                #    - 得分阈值：得分 >= 平均得分（且已有至少 3 人）
+                contribution_threshold = total_weighted_degree * 0.5
                 avg_score = sum(s["score"] for s in actor_scores.values()) / len(actor_scores) if actor_scores else 0
                 
-                cumsum = 0
+                cumsum = 0.0  # 使用加权度数的累计值
                 for node_id, score_data in sorted_actors:
                     login = graph.nodes[node_id].get("login", node_id)
                     actor_id = graph.nodes[node_id].get("actor_id", 0)
-                    degree = score_data["degree"]
+                    weighted_degree = score_data["weighted_degree"]
+                    raw_degree = score_data["degree"]  # 保留原始度数为显示
                     
-                    # 兼容旧代码：top_actors 保留前 10 个
+                    # 兼容旧代码：top_actors 保留前 10 个（使用原始度数）
                     if len(metrics.top_actors) < 10:
-                        metrics.top_actors.append((login, degree))
+                        metrics.top_actors.append((login, raw_degree))
                         metrics.top_actor_ids.append(actor_id)
                     
                     # 核心成员：满足以下条件之一时停止
-                    # 1. 已达到 70% 贡献阈值
-                    # 2. 已达到 30% 人数上限
-                    # 3. 得分低于平均值（且已有至少 3 人）
+                    # 1. 已达到 50% 加权贡献阈值
+                    # 2. 得分低于平均值（且已有至少 3 人）
                     should_stop = (
                         cumsum >= contribution_threshold or
-                        len(metrics.core_actors) >= max_core_count or
                         (score_data["score"] < avg_score and len(metrics.core_actors) >= 3)
                     )
                     
                     if not should_stop:
-                        metrics.core_actors.append((login, degree))
+                        metrics.core_actors.append((login, raw_degree))  # 显示用原始度数
                         metrics.core_actor_ids.append(actor_id)
-                        cumsum += degree
+                        cumsum += weighted_degree  # 累计使用加权度数
                 
                 # 确保至少有 2 个核心成员
                 if len(metrics.core_actors) < 2 and len(sorted_actors) >= 2:
@@ -315,20 +412,20 @@ class BurnoutAnalyzer:
                         },
                     ))
             
-            # 3. 网络密度下降（协作减少）
-            if prev.density > 0:
-                density_change = (curr.density - prev.density) / prev.density
-                if density_change < -0.3:  # 下降超过 30%
+            # 3. 聚类系数下降（协作质量下降）
+            if prev.clustering_coefficient > 0:
+                clustering_change = (curr.clustering_coefficient - prev.clustering_coefficient) / prev.clustering_coefficient
+                if clustering_change < -0.3:  # 下降超过 30%
                     alerts.append(BurnoutAlert(
                         repo_name=repo_name,
                         month=curr.month,
                         alert_type="COLLABORATION_DECLINE",
                         severity="medium",
-                        description=f"网络密度下降 {abs(density_change)*100:.1f}%",
+                        description=f"协作质量下降（聚类系数下降 {abs(clustering_change)*100:.1f}%）",
                         metrics={
-                            "prev_density": prev.density,
-                            "curr_density": curr.density,
-                            "change_rate": density_change,
+                            "prev_clustering": prev.clustering_coefficient,
+                            "curr_clustering": curr.clustering_coefficient,
+                            "change_rate": clustering_change,
                         },
                     ))
             
@@ -413,6 +510,7 @@ class BurnoutAnalyzer:
         values: List[float],
         dimension_name: str,
         max_score: float = 25.0,
+        reverse: bool = False,
     ) -> Dict[str, Any]:
         """
         计算单个维度的倦怠得分（三层分析）
@@ -421,6 +519,9 @@ class BurnoutAnalyzer:
         - 长期趋势 (40%): 线性回归斜率
         - 近期状态 (40%): 最近3个月 vs 最早3个月
         - 稳定性 (20%): 波动率惩罚
+        
+        Args:
+            reverse: 如果为 True，逻辑反转（用于流失率等：上升得高分，下降得低分）
         """
         n = len(values)
         if n < 2 or all(v == 0 for v in values):
@@ -436,10 +537,13 @@ class BurnoutAnalyzer:
         normalized = [v / first_nonzero for v in values]
         
         # ========== 1. 长期趋势 (40%) ==========
-        # 线性回归斜率，负斜率表示下降
+        # 线性回归斜率
         slope = self._linear_regression_slope(normalized)
-        # 假设 -0.1/月（每月下降10%）为极端情况
-        trend_score = max(0, min(max_score * 0.4, -slope * max_score * 4))
+        # 默认逻辑：负斜率（下降）得高分；reverse=True 时：正斜率（上升）得高分
+        if reverse:
+            trend_score = max(0, min(max_score * 0.4, slope * max_score * 4))
+        else:
+            trend_score = max(0, min(max_score * 0.4, -slope * max_score * 4))
         
         # ========== 2. 近期状态 (40%) ==========
         # 对比最近3个月和最早3个月的均值
@@ -452,7 +556,11 @@ class BurnoutAnalyzer:
         else:
             recent_change = 0
         
-        recent_score = max(0, min(max_score * 0.4, -recent_change * max_score * 0.4))
+        # 默认逻辑：变化率 < 0（下降）得高分；reverse=True 时：变化率 > 0（上升）得高分
+        if reverse:
+            recent_score = max(0, min(max_score * 0.4, recent_change * max_score * 0.4))
+        else:
+            recent_score = max(0, min(max_score * 0.4, -recent_change * max_score * 0.4))
         
         # ========== 3. 稳定性惩罚 (20%) ==========
         # 波动率 > 0.3 开始扣分
@@ -550,8 +658,9 @@ class BurnoutAnalyzer:
         churn_values = [1 - r for r in retention_values]
         
         # 核心成员流失分析
+        # 流失率上升（上升趋势）应该得高分，所以使用 reverse=True
         core_detail = self._compute_dimension_score(
-            churn_values, "core_churn", max_score=25
+            churn_values, "core_churn", max_score=25, reverse=True
         )
         
         # 添加额外的核心成员信息
@@ -567,32 +676,38 @@ class BurnoutAnalyzer:
         
         factors["core_stability"] = core_detail
         
-        # ========== 4. 协作密度 (0-25分) ==========
-        density_values = [m.density for m in sorted_metrics]
+        # ========== 4. 协作质量 (0-25分) ==========
+        # 使用聚类系数替代密度，反映协作网络的紧密程度
+        clustering_values = [m.clustering_coefficient for m in sorted_metrics]
         factors["collaboration"] = self._compute_dimension_score(
-            density_values, "collaboration", max_score=25
+            clustering_values, "collaboration", max_score=25
         )
         
         # ========== 综合评分 ==========
-        total_score = (
+        # 计算倦怠风险得分（0-100，越高越差）
+        burnout_risk_score = (
             factors["activity"]["score"] +
             factors["contributors"]["score"] +
             factors["core_stability"]["score"] +
             factors["collaboration"]["score"]
         )
         
-        # 风险等级
-        if total_score >= 60:
-            level = "high"
-        elif total_score >= 40:
-            level = "medium"
-        elif total_score >= 20:
-            level = "low"
+        # 转换为健康度得分（0-100，越高越好）
+        health_score = 100 - burnout_risk_score
+        
+        # 风险等级（基于健康度得分）
+        if health_score < 40:
+            level = "high"  # 健康度 < 40，高风险
+        elif health_score < 60:
+            level = "medium"  # 健康度 40-59，中等风险
+        elif health_score < 80:
+            level = "low"  # 健康度 60-79，低风险
         else:
-            level = "healthy"
+            level = "healthy"  # 健康度 ≥ 80，健康
         
         return {
-            "score": round(total_score, 2),
+            "score": round(health_score, 2),
+            "burnout_risk_score": round(burnout_risk_score, 2),  # 保留原始风险得分供参考
             "level": level,
             "factors": factors,
             "months_analyzed": n,

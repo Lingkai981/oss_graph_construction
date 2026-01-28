@@ -33,9 +33,10 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
         "unknown": "⚪ 未知"
     }
     
-    lines.append(f"\n🎯 综合倦怠评分: {score:.2f} / 100")
+    lines.append(f"\n🎯 健康度得分: {score:.2f} / 100")
     lines.append(f"   风险等级: {level_icons.get(level, level)}")
     lines.append(f"   分析周期: {period} ({months} 个月)")
+    lines.append(f"   💡 说明: 得分越高表示项目越健康（得分 = 100 - 倦怠风险得分）")
     
     # 获取指标时间序列
     metrics = repo_data.get("metrics", [])
@@ -85,12 +86,20 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
             dim_lines.append(f"      ⚠️ 每月平均下降 {abs(slope_pct):.1f}%")
         else:
             dim_lines.append(f"      ✅ 每月平均增长 {slope_pct:.1f}%")
-        dim_lines.append(f"      → 趋势得分: {trend_score:.2f}")
+        # 计算过程：-slope × 100（斜率<0时），最高10分
+        if slope_pct < 0:
+            dim_lines.append(f"      计算: -slope × 100 = {trend_score:.2f}分")
+        else:
+            dim_lines.append(f"      计算: 0（斜率≥0，无下降趋势）")
         
         dim_lines.append(f"   📅 近期状态 (40%权重):")
         dim_lines.append(f"      早期3月均值: {early_avg:.2f}  →  近期3月均值: {recent_avg:.2f}")
         dim_lines.append(f"      变化率: {change_pct:+.1f}%")
-        dim_lines.append(f"      → 近期得分: {recent_score:.2f}")
+        # 计算过程：-change × 10（变化率<0时），最高10分
+        if change_pct < 0:
+            dim_lines.append(f"      计算: -change × 10 = {recent_score:.2f}分")
+        else:
+            dim_lines.append(f"      计算: 0（变化率≥0，无下降）")
         
         dim_lines.append(f"   📊 稳定性 (20%权重):")
         dim_lines.append(f"      月度波动率: {volatility_pct:.1f}%")
@@ -98,9 +107,13 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
             dim_lines.append(f"      ⚠️ 波动较大 (>30%)")
         else:
             dim_lines.append(f"      ✅ 波动可控 (≤30%)")
-        dim_lines.append(f"      → 稳定性扣分: {stability_score:.2f}")
+        # 计算过程：(volatility - 0.3) × 25（波动率>0.3时），最高5分
+        if volatility_pct > 30:
+            dim_lines.append(f"      计算: (volatility - 0.3) × 25 = {stability_score:.2f}分")
+        else:
+            dim_lines.append(f"      计算: 0（波动率≤30%，稳定）")
         
-        dim_lines.append(f"   ➡️ 维度总分: {score:.2f} / 25")
+        dim_lines.append(f"   ➡️ 维度总分: {trend_score:.2f} + {recent_score:.2f} + {stability_score:.2f} = {score:.2f} / 25")
         
         return dim_lines
     
@@ -146,43 +159,68 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     recent = core_stability.get("recent_state", {})
     stability = core_stability.get("stability", {})
     
+    trend_score = trend.get('score', 0)
+    recent_score = recent.get('score', 0)
+    stability_score = stability.get('score', 0)
+    total_score = core_stability.get('score', 0)
+    
     lines.append(f"   📉 长期趋势 (40%权重):")
-    lines.append(f"      流失率斜率: {trend.get('slope_percent_per_month', 0):+.2f}%/月")
-    lines.append(f"      → 趋势得分: {trend.get('score', 0):.2f}")
+    slope_pct = trend.get('slope_percent_per_month', 0)
+    lines.append(f"      流失率斜率: {slope_pct:+.2f}%/月")
+    # 计算过程：slope × 100（斜率>0时，流失率上升得高分），最高10分
+    if slope_pct > 0:
+        lines.append(f"      计算: slope × 100 = {trend_score:.2f}分")
+    else:
+        lines.append(f"      计算: 0（斜率≤0，流失率未上升）")
     
     lines.append(f"   📅 近期状态 (40%权重):")
-    lines.append(f"      早期流失率: {recent.get('early_avg', 0)*100:.1f}%  →  近期流失率: {recent.get('recent_avg', 0)*100:.1f}%")
-    lines.append(f"      → 近期得分: {recent.get('score', 0):.2f}")
+    lines.append(f"      早期3月流失率均值: {recent.get('early_avg', 0)*100:.1f}%  →  近期3月流失率均值: {recent.get('recent_avg', 0)*100:.1f}%")
+    change_pct = recent.get('change_percent', 0)
+    # 计算过程：change × 10（变化率>0时，流失率上升得高分），最高10分
+    if change_pct > 0:
+        lines.append(f"      计算: change × 10 = {recent_score:.2f}分")
+    else:
+        lines.append(f"      计算: 0（变化率≤0，流失率未上升）")
     
     lines.append(f"   📊 稳定性 (20%权重):")
-    lines.append(f"      月度波动率: {stability.get('volatility_percent', 0):.1f}%")
-    lines.append(f"      → 稳定性扣分: {stability.get('score', 0):.2f}")
+    volatility_pct = stability.get('volatility_percent', 0)
+    lines.append(f"      月度波动率: {volatility_pct:.1f}%")
+    # 计算过程：(volatility - 0.3) × 25（波动率>0.3时），最高5分
+    if volatility_pct > 30:
+        lines.append(f"      计算: (volatility - 0.3) × 25 = {stability_score:.2f}分")
+    else:
+        lines.append(f"      计算: 0（波动率≤30%，稳定）")
     
-    lines.append(f"   ➡️ 维度总分: {core_stability.get('score', 0):.2f} / 25")
+    lines.append(f"   ➡️ 维度总分: {trend_score:.2f} + {recent_score:.2f} + {stability_score:.2f} = {total_score:.2f} / 25")
     
-    # 4. 协作密度
-    lines.append("\n【4. 协作密度】(0-25分)")
+    # 4. 协作质量（聚类系数）
+    lines.append("\n【4. 协作质量】(0-25分)")
     collaboration = factors.get("collaboration", {})
-    early_density = earliest.get("density", 0)
-    late_density = latest.get("density", 0)
-    lines.extend(format_dimension("协作密度", collaboration, early_density, late_density, ""))
+    early_clustering = earliest.get("clustering_coefficient", 0)
+    late_clustering = latest.get("clustering_coefficient", 0)
+    lines.extend(format_dimension("协作质量", collaboration, early_clustering, late_clustering, ""))
     
     # 汇总
     lines.append("\n" + "-" * 80)
     lines.append("📋 评分汇总")
     lines.append("-" * 80)
     
-    activity_score = factors.get("activity", {}).get("score", 0)
-    contributor_score = factors.get("contributors", {}).get("score", 0)
-    stability_score = factors.get("core_stability", {}).get("score", 0)
-    collaboration_score = factors.get("collaboration", {}).get("score", 0)
+    # 获取各维度的风险得分（越高越差）
+    activity_risk = factors.get("activity", {}).get("score", 0)
+    contributor_risk = factors.get("contributors", {}).get("score", 0)
+    stability_risk = factors.get("core_stability", {}).get("score", 0)
+    collaboration_risk = factors.get("collaboration", {}).get("score", 0)
+    total_risk = activity_risk + contributor_risk + stability_risk + collaboration_risk
     
-    lines.append(f"   活跃度:         {activity_score:6.2f} / 25")
-    lines.append(f"   贡献者:         {contributor_score:6.2f} / 25")
-    lines.append(f"   核心成员稳定性: {stability_score:6.2f} / 25")
-    lines.append(f"   协作密度:       {collaboration_score:6.2f} / 25")
+    lines.append(f"   各维度风险得分（越高越差）:")
+    lines.append(f"     活跃度风险:       {activity_risk:6.2f} / 25")
+    lines.append(f"     贡献者风险:       {contributor_risk:6.2f} / 25")
+    lines.append(f"     核心成员风险:     {stability_risk:6.2f} / 25")
+    lines.append(f"     协作质量风险:     {collaboration_risk:6.2f} / 25")
+    lines.append(f"     " + "-" * 30)
+    lines.append(f"     风险得分总和:     {total_risk:6.2f} / 100")
     lines.append(f"   " + "-" * 30)
-    lines.append(f"   总分:           {score:6.2f} / 100")
+    lines.append(f"   🎯 健康度得分:      {score:6.2f} / 100 (100 - {total_risk:.2f})")
     
     # 显示分析方法
     method = burnout.get("analysis_method", "legacy")
@@ -218,7 +256,7 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append("\n" + "-" * 80)
     lines.append("📅 月度指标趋势")
     lines.append("-" * 80)
-    lines.append(f"   {'月份':<10} {'事件数':>8} {'贡献者':>8} {'核心成员':>8} {'密度':>12}")
+    lines.append(f"   {'月份':<10} {'事件数':>8} {'贡献者':>8} {'核心成员':>8} {'聚类系数':>12}")
     lines.append("   " + "-" * 50)
     
     for m in sorted_metrics:
@@ -226,8 +264,8 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
         events = m.get("total_events", 0)
         actors = m.get("unique_actors", m.get("node_count", 0))
         core = m.get("core_actor_count", len(m.get("core_actors", [])))
-        density = m.get("density", 0)
-        lines.append(f"   {month:<10} {events:>8} {actors:>8} {core:>8} {density:>12.6f}")
+        clustering = m.get("clustering_coefficient", 0)
+        lines.append(f"   {month:<10} {events:>8} {actors:>8} {core:>8} {clustering:>12.6f}")
     
     lines.append("")
     return "\n".join(lines)
