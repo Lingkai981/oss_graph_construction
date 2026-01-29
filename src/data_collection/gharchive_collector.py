@@ -407,11 +407,27 @@ def main():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别 (默认: INFO)"
     )
+
+    parser.add_argument(
+        "--repo-list",
+        type=str,
+        default=None,
+        help="repo 名单 JSON 文件路径（内容为 ['owner/repo', ...]）"
+    )
     
     args = parser.parse_args()
     
     # 获取目标项目
-    target_projects = get_project_set(args.project_count)
+    # target_projects = get_project_set(args.project_count)
+
+    if args.repo_list:
+        with open(args.repo_list, "r", encoding="utf-8") as f:
+            repos = json.load(f)
+        target_projects = {r.strip().lower() for r in repos if r and r.strip()}
+    else:
+        target_projects = get_project_set(args.project_count)
+
+
     logger.info(f"目标项目数: {len(target_projects)}")
     
     # 创建收集器
