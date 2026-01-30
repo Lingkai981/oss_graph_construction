@@ -64,6 +64,7 @@ class CommunityAtmosphereAnalyzer:
         self,
         graphs_dir: str = "output/monthly-graphs/",
         output_dir: str = "output/community-atmosphere-analysis/",
+        use_top30: bool = False,
     ):
         """
         初始化分析器
@@ -71,6 +72,7 @@ class CommunityAtmosphereAnalyzer:
         Args:
             graphs_dir: 图文件目录，包含月度 GraphML 文件
             output_dir: 输出目录，存放分析结果
+            use_top30: 是否只分析 Top30 仓库，默认 False（分析所有仓库）
         """
         self.graphs_dir = Path(graphs_dir)
         self.output_dir = Path(output_dir)
@@ -133,19 +135,26 @@ class CommunityAtmosphereAnalyzer:
         self.toxicity_cache: Dict[str, Dict[str, Any]] = {}
         self._load_toxicity_cache()
         
-        # 加载 Top30 仓库列表
+        # 加载 Top30 仓库列表（仅当 use_top30=True 时启用过滤）
         self.top30_repos: set = set()
-        top30_file = Path("top30.json")
-        if top30_file.exists():
-            try:
-                with open(top30_file, "r", encoding="utf-8") as f:
-                    top30_data = json.load(f)
-                    self.top30_repos = {item["repo"] for item in top30_data}
-                logger.info(f"加载 Top30 仓库列表成功，共 {len(self.top30_repos)} 个仓库")
-            except Exception as e:
-                logger.warning(f"加载 Top30 仓库列表失败: {e}，将分析所有仓库")
+        self.use_top30 = use_top30
+        
+        if use_top30:
+            top30_file = Path("top30.json")
+            if top30_file.exists():
+                try:
+                    with open(top30_file, "r", encoding="utf-8") as f:
+                        top30_data = json.load(f)
+                        self.top30_repos = {item["repo"] for item in top30_data}
+                    logger.info(f"✓ Top30 过滤已启用，共 {len(self.top30_repos)} 个仓库")
+                except Exception as e:
+                    logger.warning(f"加载 Top30 仓库列表失败: {e}，将分析所有仓库")
+                    self.use_top30 = False
+            else:
+                logger.warning(f"Top30 仓库文件不存在: {top30_file}，将分析所有仓库")
+                self.use_top30 = False
         else:
-            logger.warning(f"Top30 仓库文件不存在: {top30_file}，将分析所有仓库")
+            logger.info("Top30 过滤未启用，将分析所有仓库")
     
     def _load_toxicity_cache(self) -> None:
         """
@@ -1036,8 +1045,8 @@ class CommunityAtmosphereAnalyzer:
         remaining_repos = {k: v for k, v in index.items() if k not in completed_repos}
         remaining_count = len(remaining_repos)
         
-        # Top30 过滤：如果配置了 Top30 列表，则只分析 Top30 仓库
-        if self.top30_repos:
+        # Top30 过滤：仅当 use_top30=True 且成功加载了 top30_repos 时启用
+        if self.use_top30 and self.top30_repos:
             before_filter = len(remaining_repos)
             remaining_repos = {k: v for k, v in remaining_repos.items() if k in self.top30_repos}
             after_filter = len(remaining_repos)
@@ -1411,16 +1420,24 @@ if __name__ == "__main__":
         default="output/community-atmosphere-analysis/",
         help="输出目录"
     )
+    parser.add_argument(
+        "--top30",
+        action="store_true",
+        default=False,
+        help="只分析 Top30 仓库（需要 top30.json 文件）"
+    )
     
     args = parser.parse_args()
     
     print(f"图目录: {args.graphs_dir}", flush=True)
     print(f"输出目录: {args.output_dir}", flush=True)
+    print(f"Top30 过滤: {'启用' if args.top30 else '禁用'}", flush=True)
     print("正在初始化分析器...", flush=True)
     
     analyzer = CommunityAtmosphereAnalyzer(
         graphs_dir=args.graphs_dir,
         output_dir=args.output_dir,
+        use_top30=args.top30,
     )
     
     print("分析器初始化完成，开始运行分析...", flush=True)
