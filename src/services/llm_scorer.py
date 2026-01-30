@@ -472,12 +472,13 @@ class LLMScorer:
         
         if not tasks_to_process:
             logger.info(f"批量评分: 全部 {len(tasks)} 个任务已有缓存，无需调用 API")
+            print(f"    ✔ 全部 {len(tasks)} 个月份已有缓存，跳过 API 调用", flush=True)
             return results
         
         total = len(tasks_to_process)
         cached_count = len(tasks) - total
         logger.info(f"批量评分: 共 {len(tasks)} 个任务，{cached_count} 个已缓存，{total} 个需调用 API")
-        print(f"开始批量 LLM 评分: {total} 个任务, {max_workers} 并发...", flush=True)
+        print(f"    📊 LLM 评分: {cached_count} 个已缓存, {total} 个需调用 API (max {max_workers} 并发)", flush=True)
         
         # 用于限流的锁和计数器
         rate_limit_lock = threading.Lock()
@@ -502,8 +503,10 @@ class LLMScorer:
             # 更新进度
             with rate_limit_lock:
                 completed_count[0] += 1
-                if completed_count[0] % 10 == 0 or completed_count[0] == total:
-                    print(f"  LLM 评分进度: {completed_count[0]}/{total}", flush=True)
+                # 每 5 个或最后一个显示进度
+                if completed_count[0] % 5 == 0 or completed_count[0] == total:
+                    pct = completed_count[0] / total * 100
+                    print(f"    ⏳ API 调用进度: {completed_count[0]}/{total} ({pct:.0f}%)", flush=True)
             
             return cache_key, result
         
@@ -525,7 +528,7 @@ class LLMScorer:
                     logger.error(f"批量评分异常: {repo_name} {month}, 错误: {e}")
                     results[cache_key] = self._default_score(str(e))
         
-        print(f"批量 LLM 评分完成: {total} 个任务", flush=True)
+        print(f"    ✔ LLM 评分完成: {total} 个 API 调用 + {cached_count} 个缓存", flush=True)
         logger.info(f"批量 LLM 评分完成: {total} 个任务")
         
         return results

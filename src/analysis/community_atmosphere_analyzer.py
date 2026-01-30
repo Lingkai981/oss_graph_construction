@@ -1044,14 +1044,26 @@ class CommunityAtmosphereAnalyzer:
             print(f"Top30 过滤：{before_filter} → {after_filter} 个待分析仓库", flush=True)
             logger.info(f"Top30 过滤：{before_filter} → {after_filter} 个待分析仓库")
             remaining_count = after_filter
+            # 重新计算已完成的项目数（仅限 Top30）
+            completed_repos = {r for r in completed_repos if r in self.top30_repos}
+            total_repos = len(self.top30_repos)
         
         if remaining_count == 0:
             print(f"所有项目已完成分析！", flush=True)
             logger.info("所有项目已完成分析")
             return existing_results
         
-        print(f"开始分析 {remaining_count} 个待处理项目（共 {total_repos} 个）...", flush=True)
-        logger.info(f"开始分析 {remaining_count} 个待处理项目（共 {total_repos} 个）...")
+        # 显示总体进度摘要
+        print(f"\n{'═' * 60}", flush=True)
+        print(f"📊 总体进度概览", flush=True)
+        print(f"{'═' * 60}", flush=True)
+        print(f"  • 总项目数: {total_repos}", flush=True)
+        print(f"  • 已完成: {len(completed_repos)} 个项目", flush=True)
+        print(f"  • 待处理: {remaining_count} 个项目", flush=True)
+        print(f"  • 完成率: {len(completed_repos) / total_repos * 100:.1f}%", flush=True)
+        print(f"{'═' * 60}\n", flush=True)
+        
+        logger.info(f"总体进度: 已完成 {len(completed_repos)}/{total_repos} ({len(completed_repos) / total_repos * 100:.1f}%)，待处理 {remaining_count} 个")
         
         all_results = existing_results.copy()  # 从已存在的结果开始
         
@@ -1072,8 +1084,21 @@ class CommunityAtmosphereAnalyzer:
             
             # 显示实际进度（包括已完成的）
             actual_idx = len(completed_repos) + repo_idx
-            print(f"[{actual_idx}/{total_repos}] 分析: {repo_name} (可分析月份={len(expected_months)})", flush=True)
-            logger.info(f"[{actual_idx}/{total_repos}] 分析: {repo_name} (可分析月份={len(expected_months)})")
+            remaining = total_repos - actual_idx
+            progress_pct = actual_idx / total_repos * 100 if total_repos > 0 else 0
+            
+            # 计算该项目有多少月份需要处理
+            repo_processed_months = self._get_processed_months_for_repo(repo_name, all_results)
+            months_to_process = len([m for m in expected_months if m not in repo_processed_months])
+            months_already_done = len(repo_processed_months & set(expected_months))
+            
+            print(f"\n{'━' * 60}", flush=True)
+            print(f"📌 项目进度: [{actual_idx}/{total_repos}] ({progress_pct:.1f}%) - 剩余 {remaining} 个项目", flush=True)
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
+            print(f"📂 当前项目: {repo_name}", flush=True)
+            print(f"   月份统计: 共 {len(expected_months)} 个月 | 已完成 {months_already_done} 个 | 待处理 {months_to_process} 个", flush=True)
+            print(f"{'━' * 60}", flush=True)
+            logger.info(f"[{actual_idx}/{total_repos}] ({progress_pct:.1f}%) 分析: {repo_name} (月份: {months_already_done}/{len(expected_months)} 已完成, {months_to_process} 待处理)")
             
             # 加载所有月份的图并计算指标
             # 从已有结果恢复本项目的已处理月份与metrics
@@ -1082,9 +1107,10 @@ class CommunityAtmosphereAnalyzer:
             processed_months = set(m.get("month") for m in existing_metrics_list if m.get("month"))
 
             total_months = len(expected_months)
+            skipped_months = 0
             for month_idx, month in enumerate(expected_months, 1):
                 if month in processed_months:
-                    print(f"  [{month_idx}/{total_months}] 跳过已完成月份: {month}", flush=True)
+                    skipped_months += 1
                     continue
 
                 discussion_path = discussion_paths.get(month)
@@ -1093,21 +1119,24 @@ class CommunityAtmosphereAnalyzer:
                     logger.warning(f"  [{month_idx}/{total_months}] 月份 {month} 缺少必要图文件，跳过 (discussion={bool(discussion_path)}, actor-actor={bool(actor_actor_path)})")
                     continue
 
-                print(f"  [{month_idx}/{total_months}] 处理月份: {month}", flush=True)
-                logger.info(f"  [{month_idx}/{total_months}] 处理月份: {month}")
+                months_remaining = total_months - month_idx
+                month_progress_pct = month_idx / total_months * 100 if total_months > 0 else 0
+                print(f"  📅 月份进度: [{month_idx}/{total_months}] ({month_progress_pct:.0f}%) - {month} | 剩余 {months_remaining} 个月", flush=True)
+                logger.info(f"  [{month_idx}/{total_months}] ({month_progress_pct:.0f}%) 处理月份: {month}, 剩余 {months_remaining} 个月")
                 logger.info(f"  [{month_idx}/{total_months}] discussion图路径: {discussion_path}")
                 logger.info(f"  [{month_idx}/{total_months}] actor-actor图路径: {actor_actor_path}")
 
-                print(f"  [{month_idx}/{total_months}] 正在加载discussion图...", flush=True)
+                print(f"     ├─ 正在加载 discussion 图...", flush=True)
                 discussion_graph = self.load_graph(discussion_path)
-                print(f"  [{month_idx}/{total_months}] 正在加载actor-actor图...", flush=True)
+                print(f"     ├─ 正在加载 actor-actor 图...", flush=True)
                 actor_graph = self.load_graph(actor_actor_path)
 
                 if discussion_graph is None or actor_graph is None:
                     logger.warning(f"  [{month_idx}/{total_months}] 图加载失败，跳过: {repo_name} {month}")
+                    print(f"     └─ ⚠️ 图加载失败，跳过此月份", flush=True)
                     continue
 
-                print(f"  [{month_idx}/{total_months}] 图加载成功，开始计算指标...", flush=True)
+                print(f"     └─ ✓ 图加载成功，开始计算指标...", flush=True)
                 try:
                     metrics = self.compute_monthly_metrics(discussion_graph, actor_graph, repo_name, month)
                     if metrics is None:
@@ -1151,10 +1180,15 @@ class CommunityAtmosphereAnalyzer:
             # 项目级：如果本项目所有expected_months都完成了，则更新summary
             expected_months_set = set(expected_months)
             if expected_months_set and expected_months_set.issubset(processed_months):
-                print(f"✓ 项目 {repo_name} 全部月份基础指标计算完成", flush=True)
+                if skipped_months == total_months:
+                    print(f"  ✔ 全部 {total_months} 个月份已有缓存，跳过指标计算", flush=True)
+                else:
+                    print(f"  ✔ 基础指标计算完成 ({total_months} 个月份)", flush=True)
                 # summary 将在 LLM 评分后更新
             else:
-                logger.info(f"{repo_name}: 尚未完成所有月份（已完成 {len(processed_months)}/{len(expected_months)}）")
+                incomplete_pct = len(processed_months) / len(expected_months) * 100 if len(expected_months) > 0 else 0
+                print(f"  ⏳ 月份进度: {len(processed_months)}/{len(expected_months)} ({incomplete_pct:.1f}%)", flush=True)
+                logger.info(f"{repo_name}: 尚未完成所有月份（已完成 {len(processed_months)}/{len(expected_months)} = {incomplete_pct:.1f}%）")
             
             # ========================================
             # 项目级批量 LLM 评分
@@ -1192,8 +1226,14 @@ class CommunityAtmosphereAnalyzer:
                             llm_tasks.append((repo_name, month, metrics_dict))
                 
                 if llm_tasks:
-                    print(f"  开始 LLM 评分: {len(llm_tasks)} 个月份待评分", flush=True)
-                    logger.info(f"  {repo_name}: 开始 LLM 评分，{len(llm_tasks)} 个月份待评分")
+                    total_llm = len(metrics_list)
+                    need_api = len(llm_tasks)
+                    cached = total_llm - need_api
+                    print(f"  🤖 LLM 评分进度:", flush=True)
+                    print(f"     ├─ 总月份数: {total_llm}", flush=True)
+                    print(f"     ├─ 已有缓存: {cached} 个", flush=True)
+                    print(f"     └─ 待评分: {need_api} 个月份", flush=True)
+                    logger.info(f"  {repo_name}: 开始 LLM 评分，总 {total_llm} 个月份，缓存 {cached} 个，待评分 {need_api} 个")
                     
                     # 批量并发评分
                     llm_results = self.llm_scorer.score_batch(llm_tasks, max_workers=8, rate_limit_delay=0.1)
@@ -1222,7 +1262,9 @@ class CommunityAtmosphereAnalyzer:
                     
                     # 保存更新后的结果
                     self.save_full_analysis(all_results)
-                    print(f"  ✓ LLM 评分完成: 更新 {updated_count} 条记录", flush=True)
+                    score = atmosphere_score.get("score", 0)
+                    level = atmosphere_score.get("level", "unknown")
+                    print(f"  ✓ 项目完成! 氛围评分: {score:.1f}/100 ({level})", flush=True)
                     logger.info(f"  {repo_name}: LLM 评分完成，更新 {updated_count} 条记录")
                     
                     # 如果该项目已完成所有月份，则更新 summary
@@ -1237,8 +1279,15 @@ class CommunityAtmosphereAnalyzer:
                         except Exception as e:
                             logger.warning(f"  更新 summary 失败: {e}")
         
-        print(f"所有项目分析完成！共分析 {len(all_results)} 个项目", flush=True)
-        logger.info(f"所有项目分析完成！共分析 {len(all_results)} 个项目")
+        # 最终汇总
+        print(f"\n{'═' * 60}", flush=True)
+        print(f"🎉 所有项目分析完成！", flush=True)
+        print(f"{'═' * 60}", flush=True)
+        print(f"  • 已分析项目数: {len(all_results)}", flush=True)
+        print(f"  • 本次新处理: {remaining_count} 个项目", flush=True)
+        print(f"  • 从缓存恢复: {len(completed_repos)} 个项目", flush=True)
+        print(f"{'═' * 60}\n", flush=True)
+        logger.info(f"所有项目分析完成！共分析 {len(all_results)} 个项目（本次处理 {remaining_count} 个，缓存 {len(completed_repos)} 个）")
         
         return all_results
     
