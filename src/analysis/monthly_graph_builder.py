@@ -37,6 +37,40 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
+
+def sanitize_graphml_attributes(g: nx.Graph) -> None:
+    """就地清洗图、节点、边属性，避免写出的 GraphML 不是合法 XML。"""
+    # graph-level
+    for k, v in list(g.graph.items()):
+        if isinstance(v, str) or v is None:
+            g.graph[k] = _sanitize_xml_text(v)
+        elif isinstance(v, (dict, list)):
+            g.graph[k] = _sanitize_xml_text(json.dumps(v, ensure_ascii=False))
+        else:
+            # numbers/bools etc are fine
+            pass
+
+    # nodes
+    for n, attrs in list(g.nodes(data=True)):
+        for k, v in list(attrs.items()):
+            if isinstance(v, str) or v is None:
+                attrs[k] = _sanitize_xml_text(v)
+            elif isinstance(v, (dict, list)):
+                attrs[k] = _sanitize_xml_text(json.dumps(v, ensure_ascii=False))
+            else:
+                pass
+
+    # edges (MultiDiGraph compatible)
+    if hasattr(g, "edges"):
+        for u, v, key, attrs in list(g.edges(keys=True, data=True)):
+            for k, val in list(attrs.items()):
+                if isinstance(val, str) or val is None:
+                    attrs[k] = _sanitize_xml_text(val)
+                elif isinstance(val, (dict, list)):
+                    attrs[k] = _sanitize_xml_text(json.dumps(val, ensure_ascii=False))
+                else:
+                    pass
+
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -56,7 +90,7 @@ class ActorStats:
         return {
             "node_type": "Actor",
             "actor_id": self.actor_id,
-            "login": self.login,
+            "login": _sanitize_xml_text(self.login),
             "event_count": self.event_count,
             "event_types": json.dumps(dict(self.event_types)),
         }
@@ -74,7 +108,7 @@ class RepoStats:
         return {
             "node_type": "Repository",
             "repo_id": self.repo_id,
-            "name": self.name,
+            "name": _sanitize_xml_text(self.name),
             "event_count": self.event_count,
             "event_types": json.dumps(dict(self.event_types)),
         }
@@ -97,15 +131,15 @@ class DiscussionStats:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "node_type": self.node_type,
-            "key": self.key,
+            "key": _sanitize_xml_text(self.key),
             "number": self.number,
-            "title": self.title[:100] if self.title else "",
-            "state": self.state,
+            "title": (_sanitize_xml_text(self.title)[:100] if self.title else ""),
+            "state": _sanitize_xml_text(self.state),
             "creator_id": self.creator_id or 0,
-            "creator_login": self.creator_login,
+            "creator_login": _sanitize_xml_text(self.creator_login),
             "comment_count": self.comment_count,
             "participants_count": len(self.participants),
-            "created_at": self.created_at or "",
+            "created_at": _sanitize_xml_text(self.created_at or ""),
         }
 
 
@@ -168,19 +202,48 @@ def group_by_month_and_repo(
 
 # ==================== 图构建函数 ====================
 
-def _escape_xml_text(text: str) -> str:
-    """转义 XML 特殊字符"""
-    if not text:
+def _sanitize_xml_text(text: str) -> str:
+    """清洗 GraphML/XML 中不合法字符，并转义 XML 特殊字符。
+
+    主要解决：
+    - XML 1.0 不允许的控制字符（会导致 not well-formed / invalid token）
+    - 未转义的特殊字符 & < > ' "
+    """
+    if text is None:
         return ""
+    if not isinstance(text, str):
+        text = str(text)
+
+    # 1) 移除 XML 1.0 不允许的字符
+    # 允许：\t \n \r；以及 U+0020 以上的常规字符（并排除 surrogate 区）
+    cleaned_chars = []
+    for ch in text:
+        code = ord(ch)
+        if ch in ("\t", "\n", "\r"):
+            cleaned_chars.append(ch)
+            continue
+        # 基本可见字符
+        if 0x20 <= code <= 0xD7FF:
+            cleaned_chars.append(ch)
+            continue
+        # 排除 surrogate：0xD800-0xDFFF
+        if 0xE000 <= code <= 0xFFFD:
+            cleaned_chars.append(ch)
+            continue
+        # 非 BMP 字符（Python 可表示）
+        if 0x10000 <= code <= 0x10FFFF:
+            cleaned_chars.append(ch)
+            continue
+        # 其它：丢弃
+    text = "".join(cleaned_chars)
+
+    # 2) 转义 XML 特殊字符（GraphML 本质是 XML）
     return (text
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;")
             .replace("'", "&apos;")
-            .replace("\x00", "")  # 移除空字符
-            .replace("\x0b", "")  # 移除垂直制表符
-            .replace("\x0c", "")  # 移除换页符
             )
 
 
@@ -352,10 +415,10 @@ def build_actor_actor_graph(
         graph.add_edge(source, target, key=edge_key,
                        edge_type=edge_data["edge_type"],
                        created_at=edge_data.get("created_at") or "",
-                       comment_body=edge_data.get("comment_body", ""))
+                       comment_body=_sanitize_xml_text(edge_data.get("comment_body", "")))
     
-    graph.graph["repo_name"] = repo_name
-    graph.graph["month"] = month
+    graph.graph["repo_name"] = _sanitize_xml_text(repo_name)
+    graph.graph["month"] = _sanitize_xml_text(month)
     graph.graph["graph_type"] = "actor-actor"
     graph.graph["total_events"] = len(events)
     
@@ -455,10 +518,10 @@ def build_actor_repo_graph(
         graph.add_edge(source, target, key=edge_key,
                        edge_type=edge_data["edge_type"],
                        created_at=edge_data.get("created_at") or "",
-                       comment_body=edge_data.get("comment_body", ""))
+                       comment_body=_sanitize_xml_text(edge_data.get("comment_body", "")))
     
-    graph.graph["repo_name"] = repo_name
-    graph.graph["month"] = month
+    graph.graph["repo_name"] = _sanitize_xml_text(repo_name)
+    graph.graph["month"] = _sanitize_xml_text(month)
     graph.graph["graph_type"] = "actor-repo"
     graph.graph["total_events"] = len(events)
     
@@ -528,7 +591,7 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="Issue",
                         number=issue_number,
-                        title=_escape_xml_text(issue.get("title") or ""),
+                        title=_sanitize_xml_text(issue.get("title") or ""),
                         state=issue.get("state") or "",
                         creator_id=issue_user.get("id"),
                         creator_login=issue_user.get("login") or "",
@@ -559,7 +622,7 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="Issue",
                         number=issue_number,
-                        title=_escape_xml_text(issue.get("title") or ""),
+                        title=_sanitize_xml_text(issue.get("title") or ""),
                         state=issue.get("state") or "",
                         creator_id=issue_user.get("id"),
                         creator_login=issue_user.get("login") or "",
@@ -601,7 +664,7 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="PullRequest",
                         number=pr_number,
-                        title=_escape_xml_text(pr.get("title") or ""),
+                        title=_sanitize_xml_text(pr.get("title") or ""),
                         state=pr.get("state") or "",
                         creator_id=pr_user.get("id"),
                         creator_login=pr_user.get("login") or "",
@@ -640,7 +703,7 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="PullRequest",
                         number=pr_number,
-                        title=_escape_xml_text(pr.get("title") or ""),
+                        title=_sanitize_xml_text(pr.get("title") or ""),
                         state=pr.get("state") or "",
                         creator_id=pr_user.get("id"),
                         creator_login=pr_user.get("login") or "",
@@ -682,10 +745,10 @@ def build_actor_discussion_graph(
         graph.add_edge(source, target, key=edge_key,
                        edge_type=edge_data["edge_type"],
                        created_at=edge_data.get("created_at") or "",
-                       comment_body=edge_data.get("comment_body", ""))
+                       comment_body=_sanitize_xml_text(edge_data.get("comment_body", "")))
     
-    graph.graph["repo_name"] = repo_name
-    graph.graph["month"] = month
+    graph.graph["repo_name"] = _sanitize_xml_text(repo_name)
+    graph.graph["month"] = _sanitize_xml_text(month)
     graph.graph["graph_type"] = "actor-discussion"
     graph.graph["total_events"] = len(events)
     
@@ -793,14 +856,18 @@ def build_monthly_graphs(
                 # 保存
                 graph_file = type_dir / f"{month}.graphml"
                 try:
+                    sanitize_graphml_attributes(graph)
                     nx.write_graphml(graph, str(graph_file))
+
                     result[repo_name][graph_type][month] = str(graph_file)
                     graph_count += 1
                     graphs_built_for_repo.append(graph_type)
+
                 except Exception as e:
                     print(f"\n    警告: 保存图失败 {graph_file}: {e}")
                     error_count += 1
                     continue
+
             
             # 每处理一个项目输出进度
             if graphs_built_for_repo:
@@ -865,10 +932,12 @@ def _process_single_repo(args_tuple):
         
         graph_file = type_dir / f"{month}.graphml"
         try:
+            sanitize_graphml_attributes(graph)
             nx.write_graphml(graph, str(graph_file))
             results.append((repo_name, graph_type, month, str(graph_file)))
         except:
             continue
+
     
     return results
 
