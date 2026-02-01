@@ -39,6 +39,85 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 
+def recalculate_score(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """根据metrics列表重新计算评分 (4:3:3)"""
+    if not metrics:
+        return {"score": 0, "level": "unknown", "factors": {}}
+    
+    # 提取并映射字段
+    tox_values = []
+    resp_values = []
+    close_values = []
+    
+    for m in metrics:
+        # 毒性: toxicity_ratio 或 toxic_rate_0_5
+        tox = m.get("toxicity_ratio")
+        if tox is None:
+            tox = m.get("toxic_rate_0_5", 0.0)
+        tox_values.append(tox)
+        
+        # 响应时间: avg_response_time 或 time_to_first_response_mean
+        resp = m.get("avg_response_time")
+        if resp is None:
+            resp = m.get("time_to_first_response_mean", 0.0)
+        resp_values.append(resp)
+        
+        # 关闭率: closing_rate 或 change_request_closure_ratio
+        close = m.get("closing_rate")
+        if close is None:
+            close = m.get("change_request_closure_ratio", 0.0)
+        close_values.append(close)
+    
+    avg_toxicity = sum(tox_values) / len(tox_values)
+    avg_response_time = sum(resp_values) / len(resp_values)
+    avg_closing_rate = sum(close_values) / len(close_values)
+    
+    # 计算得分
+    # 1) 毒性 (40%)
+    toxicity_score_raw = max(0.0, 1.0 - avg_toxicity / 0.05) * 100
+    toxicity_weighted = toxicity_score_raw * 0.40
+    
+    # 2) 响应时间 (30%)
+    response_score_raw = 100.0 / (1.0 + avg_response_time / 48.0)
+    response_weighted = response_score_raw * 0.30
+    
+    # 3) 关闭率 (30%)
+    closing_score_raw = min(100.0, avg_closing_rate * 100.0)
+    closing_weighted = closing_score_raw * 0.30
+    
+    total_score = toxicity_weighted + response_weighted + closing_weighted
+    
+    level = "poor"
+    if total_score >= 80:
+        level = "excellent"
+    elif total_score >= 60:
+        level = "good"
+    elif total_score >= 40:
+        level = "moderate"
+        
+    return {
+        "score": total_score,
+        "level": level,
+        "factors": {
+            "toxicity": {
+                "value": avg_toxicity,
+                "score": toxicity_score_raw,
+                "weighted_score": toxicity_weighted
+            },
+            "response_time": {
+                "value": avg_response_time,
+                "score": response_score_raw,
+                "weighted_score": response_weighted
+            },
+            "closing_rate": {
+                "value": avg_closing_rate,
+                "score": closing_score_raw,
+                "weighted_score": closing_weighted
+            }
+        }
+    }
+
+
 def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     """生成单个仓库的详细报告"""
     lines = []
@@ -46,12 +125,31 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append(f"📊 项目: {repo_name}")
     lines.append("=" * 80)
     
-    # 获取氛围评分
-    atmosphere = repo_data.get("atmosphere_score", {})
+    # 获取指标时间序列
+    metrics = repo_data.get("metrics", [])
+    if len(metrics) < 2:
+        lines.append("\n⚠️ 数据不足，无法进行趋势分析")
+        return "\n".join(lines)
+        
+    # 重新计算评分 (覆盖原来的 atmosphere_score)
+    atmosphere = recalculate_score(metrics)
     score = atmosphere.get("score", 0)
     level = atmosphere.get("level", "unknown")
-    period = atmosphere.get("period", "N/A")
-    months = atmosphere.get("months_analyzed", 0)
+    
+    # 获取原来的元数据 (period, months)
+    orig_atmosphere = repo_data.get("atmosphere_score", {})
+    if not orig_atmosphere:
+         orig_atmosphere = {}
+    
+    # 尝试从 metrics 推断
+    months_list = [m.get("month") for m in metrics]
+    months_list.sort()
+    if months_list:
+        period = f"{months_list[0]} to {months_list[-1]}"
+        months = len(months_list)
+    else:
+        period = orig_atmosphere.get("period", "N/A")
+        months = orig_atmosphere.get("months_analyzed", 0)
     
     # 氛围等级图标
     level_icons = {
@@ -59,7 +157,6 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
         "good": "🟢 良好",
         "moderate": "🟡 中等",
         "poor": "🔴 较差",
-        "insufficient_data": "⚪ 数据不足",
         "unknown": "⚪ 未知"
     }
     
@@ -67,178 +164,90 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append(f"   氛围等级: {level_icons.get(level, level)}")
     lines.append(f"   分析周期: {period} ({months} 个月)")
     
-    # 获取指标时间序列
-    metrics = repo_data.get("metrics", [])
-    if len(metrics) < 3:
-        lines.append("\n⚠️ 数据不足（少于3个月），无法进行趋势分析")
-        return "\n".join(lines)
-    
     # 按月份排序
     sorted_metrics = sorted(metrics, key=lambda m: m.get("month", ""))
     earliest = sorted_metrics[0]
     latest = sorted_metrics[-1]
     
     lines.append("\n" + "-" * 80)
-    lines.append("📈 各因子详细分析（三层架构：长期趋势40% + 近期状态40% + 稳定性20%）")
+    lines.append("📈 各因子详细分析（三大因子：毒性40% + 响应时间30% + 关闭率30%）")
     lines.append("-" * 80)
     
     factors = atmosphere.get("factors", {})
-    weights = atmosphere.get("weights", {"llm": 0.4, "clustering": 0.3, "diameter": 0.3})
     
     # ========================================
-    # 1. 大模型评分因子 (40%)
+    # 1. 毒性因子 (40%)
     # ========================================
-    lines.append("\n【1. 大模型评分因子】(权重40%)")
-    llm_score_factor = factors.get("llm_score", 0)
+    lines.append("\n【1. 毒性因子】(0-40分，权重40%)")
+    tox_factor = factors.get("toxicity", {})
     
-    # 收集 LLM 评分数据
-    llm_scores = [m.get("llm_score", 0) for m in sorted_metrics]
-    has_llm_data = any(s > 0 for s in llm_scores)
-    
-    if has_llm_data:
-        early_llm = sorted_metrics[0].get("llm_score", 0)
-        late_llm = sorted_metrics[-1].get("llm_score", 0)
+    # 收集数据
+    tox_values = []
+    for m in sorted_metrics:
+        # 兼容新旧字段
+        v = m.get("toxicity_ratio")
+        if v is None:
+            v = m.get("toxic_rate_0_5", 0.0)
+        tox_values.append(v)
         
-        lines.append(f"   📊 数据概览:")
-        lines.append(f"      首月 LLM 评分: {early_llm:.1f}  →  末月 LLM 评分: {late_llm:.1f}")
-        
-        # 计算趋势
-        if len(llm_scores) >= 3:
-            early_avg = sum(llm_scores[:3]) / 3
-            recent_avg = sum(llm_scores[-3:]) / 3
-            change = recent_avg - early_avg
-            lines.append(f"      早期3月均值: {early_avg:.1f}  →  近期3月均值: {recent_avg:.1f}")
-            if change > 0:
-                lines.append(f"      ✅ LLM 评分趋势向好 (提升 {change:+.1f})")
-            elif change < 0:
-                lines.append(f"      ⚠️ LLM 评分趋势下降 (下降 {abs(change):.1f})")
-            else:
-                lines.append(f"      ➡️ LLM 评分保持稳定")
-        
-        # 展示毒性和响应子维度
-        lines.append(f"\n   📋 子维度分析:")
-        
-        # 毒性分析
-        toxicity_means = [m.get("toxicity_mean", 0) for m in sorted_metrics]
-        toxic_rates = [m.get("toxic_rate_0_5", 0) for m in sorted_metrics]
-        avg_toxicity = sum(toxicity_means) / len(toxicity_means)
-        avg_toxic_rate = sum(toxic_rates) / len(toxic_rates)
-        
-        early_toxicity = toxicity_means[0]
-        late_toxicity = toxicity_means[-1]
-        
-        lines.append(f"      [毒性分析]")
-        lines.append(f"         首月平均毒性: {early_toxicity:.4f}  →  末月平均毒性: {late_toxicity:.4f}")
-        lines.append(f"         整体平均毒性: {avg_toxicity:.4f}")
-        lines.append(f"         平均高毒性评论占比: {avg_toxic_rate:.2%}")
-        
-        # 响应时间分析
-        response_times = [m.get("time_to_first_response_median", 0) for m in sorted_metrics]
-        closure_ratios = [m.get("change_request_closure_ratio", 0) for m in sorted_metrics]
-        avg_response = sum(response_times) / len(response_times)
-        avg_closure = sum(closure_ratios) / len(closure_ratios)
-        
-        early_response = response_times[0]
-        late_response = response_times[-1]
-        
-        lines.append(f"      [响应效率]")
-        lines.append(f"         首月响应时间中位数: {early_response:.1f}h  →  末月: {late_response:.1f}h")
-        lines.append(f"         整体平均响应时间: {avg_response:.1f}h")
-        lines.append(f"         平均变更请求关闭率: {avg_closure:.2f}")
-        
-        # LLM 给出的理由（取最新月份的）
-        latest_reason = latest.get("llm_overall_reason", "")
-        if latest_reason:
-            lines.append(f"\n   💬 LLM 评价 (最新月份):")
-            # 将理由按行显示，每行最多60字符
-            reason_lines = [latest_reason[i:i+60] for i in range(0, len(latest_reason), 60)]
-            for rl in reason_lines[:3]:  # 最多显示3行
-                lines.append(f"      {rl}")
-    else:
-        lines.append(f"   ⚠️ 无 LLM 评分数据（API 未配置或评分失败）")
-        lines.append(f"   ➡️ 该维度使用占位值 0，仅使用聚类系数和网络直径进行评分")
-    
-    lines.append(f"\n   ➡️ 因子得分: {llm_score_factor:.2f} (三层分析后的综合分，满分100)")
-    
-    # ========================================
-    # 2. 聚类系数因子 (30%)
-    # ========================================
-    lines.append("\n【2. 聚类系数因子】(权重30%)")
-    clustering_score_factor = factors.get("clustering_score", 0)
-    
-    clustering_values = [m.get("global_clustering_coefficient", 0) for m in sorted_metrics]
-    avg_clustering = sum(clustering_values) / len(clustering_values)
-    
-    early_clustering = earliest.get("global_clustering_coefficient", 0)
-    late_clustering = latest.get("global_clustering_coefficient", 0)
+    avg_tox = tox_factor.get("value", 0)
+    early_tox = tox_values[0]
+    late_tox = tox_values[-1]
     
     lines.append(f"   📊 数据概览:")
-    lines.append(f"      首月聚类系数: {early_clustering:.4f}  →  末月聚类系数: {late_clustering:.4f}")
-    lines.append(f"      整体平均聚类系数: {avg_clustering:.4f} (范围: 0.0 到 1.0)")
+    lines.append(f"      首月毒性占比: {early_tox:.2%}  →  末月毒性占比: {late_tox:.2%}")
+    lines.append(f"      整体平均毒性: {avg_tox:.2%}")
     
-    # 计算趋势
-    if len(clustering_values) >= 3:
-        early_avg = sum(clustering_values[:3]) / 3
-        recent_avg = sum(clustering_values[-3:]) / 3
-        change = recent_avg - early_avg
-        lines.append(f"      早期3月均值: {early_avg:.4f}  →  近期3月均值: {recent_avg:.4f}")
-        if change > 0.01:
-            lines.append(f"      ✅ 聚类系数提升 (提升 {change:+.4f})")
-        elif change < -0.01:
-            lines.append(f"      ⚠️ 聚类系数下降 (下降 {abs(change):.4f})")
-        else:
-            lines.append(f"      ➡️ 聚类系数保持稳定")
-    
-    # 社区规模信息
-    avg_nodes = sum(m.get("actor_graph_nodes", 0) for m in sorted_metrics) / len(sorted_metrics)
-    avg_edges = sum(m.get("actor_graph_edges", 0) for m in sorted_metrics) / len(sorted_metrics)
-    lines.append(f"      平均参与者数量: {avg_nodes:.0f} 人")
-    lines.append(f"      平均协作边数量: {avg_edges:.0f} 条")
-    
-    lines.append(f"\n   ➡️ 因子得分: {clustering_score_factor:.2f} (三层分析后的综合分，满分100)")
-    lines.append(f"      (正向指标：聚类系数越高，社区越紧密，得分越高)")
-    
+    lines.append(f"   ➡️ 因子得分: {tox_factor.get('weighted_score', 0):.2f} / 40 (原始分: {tox_factor.get('score', 0):.2f})")
+    lines.append(f"      (目标: 0%毒性 -> 100分)")
+
     # ========================================
-    # 3. 网络直径因子 (30%)
+    # 2. 响应时间因子 (30%)
     # ========================================
-    lines.append("\n【3. 网络直径因子】(权重30%)")
-    diameter_score_factor = factors.get("diameter_score", 0)
+    lines.append("\n【2. 响应时间因子】(0-30分，权重30%)")
+    resp_factor = factors.get("response_time", {})
     
-    path_values = [m.get("average_path_length", 0) for m in sorted_metrics]
-    diameter_values = [m.get("diameter", 0) for m in sorted_metrics]
-    avg_path = sum(path_values) / len(path_values)
-    avg_diameter = sum(diameter_values) / len(diameter_values)
-    
-    early_path = earliest.get("average_path_length", 0)
-    late_path = latest.get("average_path_length", 0)
-    early_diameter = earliest.get("diameter", 0)
-    late_diameter = latest.get("diameter", 0)
+    resp_values = []
+    for m in sorted_metrics:
+        v = m.get("avg_response_time")
+        if v is None:
+            v = m.get("time_to_first_response_mean") # 优先用 mean
+        if v is None:
+            v = m.get("time_to_first_response_median", 0.0)
+        resp_values.append(v)
+        
+    avg_resp = resp_factor.get("value", 0)
+    early_resp = resp_values[0]
+    late_resp = resp_values[-1]
     
     lines.append(f"   📊 数据概览:")
-    lines.append(f"      首月平均路径长度: {early_path:.2f}  →  末月平均路径长度: {late_path:.2f}")
-    lines.append(f"      首月网络直径: {early_diameter:.0f}  →  末月网络直径: {late_diameter:.0f}")
-    lines.append(f"      整体平均路径长度: {avg_path:.2f}")
-    lines.append(f"      整体平均网络直径: {avg_diameter:.1f}")
+    lines.append(f"      首月平均响应: {early_resp:.1f}h  →  末月平均响应: {late_resp:.1f}h")
+    lines.append(f"      整体平均响应: {avg_resp:.1f}h")
     
-    # 计算趋势
-    if len(path_values) >= 3:
-        early_avg = sum(path_values[:3]) / 3
-        recent_avg = sum(path_values[-3:]) / 3
-        change = recent_avg - early_avg
-        lines.append(f"      早期3月均值: {early_avg:.2f}  →  近期3月均值: {recent_avg:.2f}")
-        if change < -0.1:
-            lines.append(f"      ✅ 路径长度缩短 (减少 {abs(change):.2f})")
-        elif change > 0.1:
-            lines.append(f"      ⚠️ 路径长度增加 (增加 {change:.2f})")
-        else:
-            lines.append(f"      ➡️ 路径长度保持稳定")
+    lines.append(f"   ➡️ 因子得分: {resp_factor.get('weighted_score', 0):.2f} / 30 (原始分: {resp_factor.get('score', 0):.2f})")
+
+    # ========================================
+    # 3. 关闭率因子 (30%)
+    # ========================================
+    lines.append("\n【3. 关闭率因子】(0-30分，权重30%)")
+    close_factor = factors.get("closing_rate", {})
     
-    # 连通性信息
-    connected_count = sum(1 for m in sorted_metrics if m.get("is_connected", False))
-    lines.append(f"      完全连通月份: {connected_count}/{len(sorted_metrics)} 个月")
+    close_values = []
+    for m in sorted_metrics:
+        v = m.get("closing_rate")
+        if v is None:
+            v = m.get("change_request_closure_ratio", 0.0)
+        close_values.append(v)
+        
+    avg_close = close_factor.get("value", 0)
+    early_close = close_values[0]
+    late_close = close_values[-1]
     
-    lines.append(f"\n   ➡️ 因子得分: {diameter_score_factor:.2f} (三层分析后的综合分，满分100)")
-    lines.append(f"      (负向指标：路径长度越短，沟通效率越高，得分越高)")
+    lines.append(f"   📊 数据概览:")
+    lines.append(f"      首月关闭率: {early_close:.2%}  →  末月关闭率: {late_close:.2%}")
+    lines.append(f"      整体平均关闭率: {avg_close:.2%}")
+    
+    lines.append(f"   ➡️ 因子得分: {close_factor.get('weighted_score', 0):.2f} / 30 (原始分: {close_factor.get('score', 0):.2f})")
     
     # ========================================
     # 评分汇总
@@ -247,44 +256,11 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append("📋 评分汇总")
     lines.append("-" * 80)
     
-    llm_weight = weights.get("llm", 0.4)
-    clustering_weight = weights.get("clustering", 0.3)
-    diameter_weight = weights.get("diameter", 0.3)
-    
-    lines.append(f"   大模型评分因子:   {llm_score_factor:6.2f} × {llm_weight:.0%} = {llm_score_factor * llm_weight:6.2f}")
-    lines.append(f"   聚类系数因子:     {clustering_score_factor:6.2f} × {clustering_weight:.0%} = {clustering_score_factor * clustering_weight:6.2f}")
-    lines.append(f"   网络直径因子:     {diameter_score_factor:6.2f} × {diameter_weight:.0%} = {diameter_score_factor * diameter_weight:6.2f}")
-    lines.append(f"   " + "-" * 40)
-    lines.append(f"   总分:                              {score:6.2f} / 100")
-    
-    lines.append(f"\n   📐 分析方法: 三层架构 (长期趋势40% + 近期状态40% + 稳定性20%)")
-    
-    # ========================================
-    # CHAOSS 指标详情
-    # ========================================
-    lines.append("\n" + "-" * 80)
-    lines.append("📊 CHAOSS 社区健康指标详情")
-    lines.append("-" * 80)
-    
-    # 变更请求统计
-    total_opened_prs = sum(m.get("opened_prs", 0) for m in sorted_metrics)
-    total_closed_prs = sum(m.get("closed_prs", 0) for m in sorted_metrics)
-    total_opened_issues = sum(m.get("opened_issues", 0) for m in sorted_metrics)
-    total_closed_issues = sum(m.get("closed_issues", 0) for m in sorted_metrics)
-    
-    lines.append(f"   [变更请求关闭率]")
-    lines.append(f"      累计打开 PR: {total_opened_prs}  →  累计关闭 PR: {total_closed_prs}")
-    lines.append(f"      累计打开 Issue: {total_opened_issues}  →  累计关闭 Issue: {total_closed_issues}")
-    if total_opened_prs + total_opened_issues > 0:
-        overall_closure = (total_closed_prs + total_closed_issues) / (total_opened_prs + total_opened_issues)
-        lines.append(f"      整体关闭率: {overall_closure:.2f}")
-    
-    # 响应时间统计
-    response_medians = [m.get("time_to_first_response_median", 0) for m in sorted_metrics if m.get("time_to_first_response_median", 0) > 0]
-    if response_medians:
-        lines.append(f"\n   [首次响应时间]")
-        lines.append(f"      中位数范围: {min(response_medians):.1f}h ~ {max(response_medians):.1f}h")
-        lines.append(f"      平均中位数: {sum(response_medians)/len(response_medians):.1f}h")
+    lines.append(f"   毒性因子:         {tox_factor.get('weighted_score', 0):.2f} / 40  (权重40%)")
+    lines.append(f"   响应时间因子:      {resp_factor.get('weighted_score', 0):.2f} / 30  (权重30%)")
+    lines.append(f"   关闭率因子:        {close_factor.get('weighted_score', 0):.2f} / 30  (权重30%)")
+    lines.append(f"   " + "-" * 30)
+    lines.append(f"   总分:               {score:.2f} / 100")
     
     # ========================================
     # 月度指标趋势
@@ -294,19 +270,17 @@ def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
     lines.append("-" * 80)
     
     # 表头
-    lines.append(f"   {'月份':<10} {'LLM分':>6} {'毒性':>8} {'聚类系数':>10} {'路径长度':>10} {'响应时间':>10} {'关闭率':>8}")
-    lines.append("   " + "-" * 72)
+    lines.append(f"   {'月份':<10} {'毒性':>10} {'响应时间(h)':>15} {'关闭率':>12}")
+    lines.append("   " + "-" * 70)
     
-    for m in sorted_metrics:
+    for i, m in enumerate(sorted_metrics):
         month = m.get("month", "N/A")
-        llm = m.get("llm_score", 0)
-        toxicity = m.get("toxicity_mean", 0)
-        clustering = m.get("global_clustering_coefficient", 0)
-        path_length = m.get("average_path_length", 0)
-        response = m.get("time_to_first_response_median", 0)
-        closure = m.get("change_request_closure_ratio", 0)
+        # Reuse collected values
+        tox = tox_values[i]
+        resp = resp_values[i]
+        close = close_values[i]
         
-        lines.append(f"   {month:<10} {llm:>6.0f} {toxicity:>8.4f} {clustering:>10.4f} {path_length:>10.2f} {response:>9.1f}h {closure:>8.2f}")
+        lines.append(f"   {month:<10} {tox:>10.2%} {resp:>15.1f} {close:>12.2%}")
     
     lines.append("")
     return "\n".join(lines)
@@ -397,9 +371,11 @@ def main():
     # 按氛围评分排序
     repos_with_scores = []
     for repo in repos_to_analyze:
-        repo_data = data[repo]
-        score = repo_data.get("atmosphere_score", {}).get("score", 0)
-        level = repo_data.get("atmosphere_score", {}).get("level", "unknown")
+        # 使用新的评分逻辑进行排序
+        metrics = data[repo].get("metrics", [])
+        new_atmosphere = recalculate_score(metrics)
+        score = new_atmosphere.get("score", 0)
+        level = new_atmosphere.get("level", "unknown")
         repos_with_scores.append((repo, score, level))
     
     repos_with_scores.sort(key=lambda x: x[1], reverse=True)
@@ -434,8 +410,7 @@ def main():
     
     # 评分体系说明
     reports.append("📐 评分体系说明:")
-    reports.append("   综合评分 = 大模型评分(40%) + 聚类系数(30%) + 网络直径(30%)")
-    reports.append("   每个维度使用三层分析：长期趋势(40%) + 近期状态(40%) + 稳定性(20%)")
+    reports.append("   综合评分 = 毒性因子(40%) + 响应时间因子(30%) + 关闭率因子(30%)")
     reports.append("")
     
     # 摘要表格
