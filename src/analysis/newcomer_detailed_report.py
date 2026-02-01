@@ -129,147 +129,196 @@ def _fmt_score_block(name: str, three_layer: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _compute_health_score(repo_data: Dict[str, Any]) -> float:
+    """计算健康分 (100 - total_risk)"""
+    three = repo_data.get("three_layer_analysis", {}) or {}
+    risk_scores = [
+        (three.get("newcomer_distance", {}) or {}).get("total_score", 0),
+        (three.get("periphery_to_core_monthly", {}) or {}).get("total_score", 0),
+        (three.get("unreachable_to_all_core_rate", {}) or {}).get("total_score", 0),
+        (three.get("unreachable_to_any_core_rate", {}) or {}).get("total_score", 0),
+    ]
+    return max(0.0, 100.0 - sum(risk_scores))
+
+
+def generate_summary_table(repos_ranked: List[Tuple[str, float]], all_data: Dict[str, Any]) -> str:
+    """生成汇总排名表"""
+    lines = []
+    lines.append("-" * 90)
+    lines.append("🏆 项目新人友好度总排名 (分数越高越好)")
+    lines.append("-" * 90)
+    lines.append(f"{'排名':<6} {'项目名称':<40} {'健康分':>10}")
+    lines.append("-" * 90)
+
+    for idx, (repo, score) in enumerate(repos_ranked, 1):
+        lines.append(f"{idx:<6} {repo:<40} {score:>10.2f}")
+
+    lines.append("-" * 90)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def generate_repo_report(repo_name: str, repo_data: Dict[str, Any]) -> str:
-    lines: List[str] = []
+    """生成单个项目的详细报告"""
+    # 提取数据
+    newcomer = repo_data.get("newcomer_distance", {}) or {}
+    p2c = repo_data.get("periphery_to_core", {}) or {}
+    reach = repo_data.get("core_reachability", {}) or {}
+    three = repo_data.get("three_layer_analysis", {}) or {}
+
+    reach_overall = reach.get("overall", {}) or {}
+
+    # 计算分数
+    health_score = _compute_health_score(repo_data)
+
+    # 预警等级
+    warning_level = "low"
+    if health_score < 60:
+        warning_level = "high"
+    elif health_score < 80:
+        warning_level = "medium"
+
+    level_icons = {
+        "low": "🟢 优秀 (Low Risk)",
+        "medium": "🟡 良好 (Medium Risk)",
+        "high": "🔴 需关注 (High Risk)"
+    }
+
+    lines = []
     lines.append("=" * 90)
     lines.append(f"📊 项目: {repo_name}")
     lines.append("=" * 90)
+    lines.append(f"⭐ 新人友好度健康分: {health_score:.4f} / 100")
+    lines.append(f"   等级: {level_icons.get(warning_level)}")
 
-    newcomer = repo_data.get("newcomer_distance", {})
-    p2c = repo_data.get("periphery_to_core", {})
-    reach = repo_data.get("core_reachability", {})
-    three = repo_data.get("three_layer_analysis", {}) or {}
+    # 异常说明 (Risk > 10)
+    abnormalities = []
+    keys_map = {
+        "newcomer_distance": "新人需要较长时间才能成为核心(距离远)",
+        "periphery_to_core_monthly": "新人晋升核心耗时变长",
+        "unreachable_to_all_core_rate": "新人无法接触任何核心成员(完全断裂)",
+        "unreachable_to_any_core_rate": "新人难以接触部分核心成员(部分断裂)"
+    }
 
-    # ---- 总得分 & 预警等级 ----
-    total_score = compute_total_score(repo_data)
-    icon, level = warning_level(total_score)
+    for key, desc in keys_map.items():
+        score = (three.get(key, {}) or {}).get("total_score", 0)
+        if score > 10:
+             abnormalities.append(f"   - {desc} (风险扣分: {score:.4f})")
+             
+    if abnormalities:
+        lines.append(f"⚠️ 主要风险点:")
+        for a in abnormalities:
+            lines.append(a)
 
-    lines.append(f"⭐ 总得分（四项三层总分之和）: {_fmt(total_score, ndigits=4)}")
-    lines.append(f"{icon} 预警等级: {level}")
-
-    issues = flagged_issues(repo_data, threshold=10.0)
-    if issues:
-        lines.append("⚠️ 单项异常说明（单项得分 > 10）:")
-        for _, score, msg in issues:
-            lines.append(f"   - {msg}（得分: {_fmt(score, ndigits=4)}）")
-    else:
-        lines.append("✅ 单项异常说明: 无（所有单项得分 ≤ 10）")
-
-    # ---- 概览 ----
-    overall_dist = newcomer.get("overall_avg_shortest_path_to_core")
-    avg_months_to_core = p2c.get("average_months_to_core")
-    reach_overall = reach.get("overall", {}) or {}
-    unreach_all_rate = reach_overall.get("overall_unreachable_to_all_core_rate")
-    unreach_any_rate = reach_overall.get("overall_unreachable_to_any_core_rate")
-
-    lines.append("\n🎯 指标概览（项目级）")
-    lines.append(f"   ① 新人到核心平均步长（overall）: {_fmt(overall_dist)}")
-    lines.append(f"   ② Periphery→Core 平均耗时（月）（overall）: {_fmt(avg_months_to_core)}")
-    lines.append("   ③ 不可达比例（overall）:")
-    lines.append(f"      - 与所有 core 不可达: {_fmt_pct(unreach_all_rate)}")
-    lines.append(f"      - 与至少一个 core 不可达: {_fmt_pct(unreach_any_rate)}")
+    lines.append("")
+    lines.append("🎯 核心指标概览")
+    lines.append(f"   ① 新人到核心平均步长: {_fmt(newcomer.get('overall_avg_shortest_path_to_core'))}")
+    lines.append(f"   ② 晋升核心平均耗时: {_fmt(p2c.get('average_months_to_core'))} 个月")
+    lines.append(f"   ③ 核心成员不可达比例:")
+    lines.append(f"      - 与所有 Core 不可达: {_fmt_pct(reach_overall.get('overall_unreachable_to_all_core_rate'))}")
+    lines.append(f"      - 与任一 Core 不可达: {_fmt_pct(reach_overall.get('overall_unreachable_to_any_core_rate'))}")
 
     # ---- 三层分析 ----
     lines.append("\n" + "-" * 90)
-    lines.append("📈 三层分析（长期趋势 / 近期状态 / 稳定性）")
+    lines.append("📈 三层分析详情 (Trend / Recent / Stability) - 扣分制(分数越低越好)")
     lines.append("-" * 90)
 
-    lines.extend(_fmt_score_block("新人到核心平均步长", three.get("newcomer_distance", {})))
-    lines.extend(_fmt_score_block("每月新晋核心的 Periphery→Core 耗时", three.get("periphery_to_core_monthly", {})))
-    lines.extend(_fmt_score_block("与所有 core 不可达比例", three.get("unreachable_to_all_core_rate", {})))
-    lines.extend(_fmt_score_block("与至少一个 core 不可达比例", three.get("unreachable_to_any_core_rate", {})))
+    def _print_three(title, key):
+        tdata = three.get(key, {}) or {}
+        n = tdata.get("n_points", 0)
+        total = tdata.get("total_score", 0.0)
+        trend = tdata.get("trend", {})
+        recent = tdata.get("recent", {})
+        stability = tdata.get("stability", {})
 
-    # ---- 月度趋势表 ----
-    lines.append("\n" + "-" * 90)
-    lines.append("📅 月度趋势（来自 newcomer_analyzer 输出的 monthly_summary）")
+        lines.append(f"   【{title}】")
+        lines.append(f"      数据点数: {n}")
+        lines.append(f"      风险扣分: {total:.4f} / 25")
+
+        # Trend
+        slope = trend.get("slope", 0)
+        t_score = trend.get("score", 0)
+        icon = "📉" if slope > 0 else "📈"  # growth is bad here
+        lines.append(f"      {icon} 长期趋势: slope={slope:.6f}  score={t_score:.4f}")
+
+        # Recent
+        e_avg = recent.get("early_avg", 0)
+        r_avg = recent.get("recent_avg", 0)
+        change = recent.get("change", 0)
+        r_score = recent.get("score", 0)
+        lines.append(f"      📅 近期状态: early={e_avg:.4f}  recent={r_avg:.4f}  change={change:.6f}  score={r_score:.4f}")
+
+        # Stability
+        vol = stability.get("volatility", 0)
+        s_score = stability.get("score", 0)
+        lines.append(f"      📊 稳定性: volatility={vol:.6f}  score={s_score:.4f}")
+
+    _print_three("新人到核心平均步长", "newcomer_distance")
+    _print_three("晋升核心耗时", "periphery_to_core_monthly")
+    _print_three("与所有 Core 不可达比例", "unreachable_to_all_core_rate")
+    _print_three("与任一 Core 不可达比例", "unreachable_to_any_core_rate")
+
+    lines.append("")
     lines.append("-" * 90)
+    lines.append("📅 月度趋势表")
+    lines.append("-" * 90)
+    lines.append(f"   {'月份':<16} {'新人数':<10} {'新人步长':<10} {'新晋核':<10} {'晋核耗时':<12} {'all不可达':<12} {'any不可达':<12}")
+    lines.append("   " + "-" * 86)
 
-    newcomer_monthly = newcomer.get("monthly_summary", []) or []
-    p2c_monthly = p2c.get("monthly_summary", []) or []
-    reach_monthly = reach.get("monthly_summary", []) or []
+    # Merge monthly data
+    # newcomer_distance.monthly_summary
+    # periphery_to_core.monthly_summary
+    # core_reachability.monthly_summary
 
-    def _index_by_month(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        for it in items:
-            m = it.get("month")
-            if m:
-                out[m] = it
-        return out
+    nm_map = {m["month"]: m for m in newcomer.get("monthly_summary", [])}
+    pc_map = {m["month"]: m for m in p2c.get("monthly_summary", [])}
+    cr_map = {m["month"]: m for m in reach.get("monthly_summary", [])}
 
-    idx_new = _index_by_month(newcomer_monthly)
-    idx_p2c = _index_by_month(p2c_monthly)
-    idx_rch = _index_by_month(reach_monthly)
+    all_months = sorted(set(nm_map.keys()) | set(pc_map.keys()) | set(cr_map.keys()))
 
-    all_months = sorted(set(idx_new.keys()) | set(idx_p2c.keys()) | set(idx_rch.keys()))
-    if not all_months:
-        lines.append("   ⚠️ 无月度数据")
-        lines.append("")
-        return "\n".join(lines)
+    for mon in all_months:
+        nm = nm_map.get(mon, {})
+        pc = pc_map.get(mon, {})
+        cr = cr_map.get(mon, {})
 
-    header = (
-        f"   {'月份':<10}"
-        f"{'新人数':>8} {'新人步长':>10}"
-        f"{'新晋核':>8} {'晋核耗时':>10}"
-        f"{'all不可达':>12} {'any不可达':>12}"
-    )
-    lines.append(header)
-    lines.append("   " + "-" * (len(header) - 3))
+        c0 = _fmt(nm.get("newcomers", 0))
+        c1 = _fmt(nm.get("avg_shortest_path_to_core"), "N/A")
+        c2 = _fmt(pc.get("new_core_count", 0))
+        c3 = _fmt(pc.get("avg_months_to_core"), "N/A")
+        c4 = _fmt_pct(cr.get("unreachable_to_all_core_rate"), "N/A")
+        c5 = _fmt_pct(cr.get("unreachable_to_any_core_rate"), "N/A")
 
-    for month in all_months:
-        nm = idx_new.get(month, {})
-        pm = idx_p2c.get(month, {})
-        rm = idx_rch.get(month, {})
-
-        newcomers = nm.get("newcomers", 0)
-        avg_dist_m = nm.get("avg_shortest_path_to_core")
-
-        new_core_count = pm.get("new_core_count", 0)
-        avg_m2c_m = pm.get("avg_months_to_core")
-
-        all_rate = rm.get("unreachable_to_all_core_rate")
-        any_rate = rm.get("unreachable_to_any_core_rate")
-
-        lines.append(
-            f"   {month:<10}"
-            f"{newcomers:>8} {(_fmt(avg_dist_m, ndigits=4)):>10}"
-            f"{new_core_count:>8} {(_fmt(avg_m2c_m, ndigits=4)):>10}"
-            f"{(_fmt_pct(all_rate, ndigits=2)):>12} {(_fmt_pct(any_rate, ndigits=2)):>12}"
-        )
+        lines.append(f"   {mon:<16} {c0:<10} {c1:<10} {c2:<10} {c3:<12} {c4:<12} {c5:<12}")
 
     lines.append("")
     return "\n".join(lines)
 
 
-# 兼容原 --top 排序逻辑：按总得分（四项三层总分之和）降序
-def _compute_sort_key(repo_data: Dict[str, Any]) -> float:
-    return compute_total_score(repo_data)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="生成 Newcomer / Core-evolution 详细分析报告（优化版）")
+    parser = argparse.ArgumentParser(description="Newcomer / Core-evolution 详细报告生成器")
     parser.add_argument(
         "--input",
         type=str,
         default="output/newcomer-analysis/full_analysis.json",
-        help="输入的完整分析文件路径（newcomer_analyzer 输出）",
+        help="输入分析文件路径",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="output/newcomer-analysis/detailed_report_optimized.txt",
+        default="output/newcomer-analysis/detailed_report.txt",
         help="输出报告文件路径",
     )
     parser.add_argument(
         "--repo",
         type=str,
         default=None,
-        help="只分析指定的仓库（可用逗号分隔多个）",
+        help="只分析指定的仓库",
     )
     parser.add_argument(
         "--top",
         type=int,
         default=None,
-        help="只输出总得分最高的前 N 个项目（总得分=四项三层总分之和）",
+        help="只输出前 N 个项目",
     )
 
     args = parser.parse_args()
@@ -288,15 +337,14 @@ def main():
     if args.repo:
         specified = [r.strip() for r in args.repo.split(",") if r.strip()]
         repos_to_analyze = [r for r in repos_to_analyze if r in specified]
-        if not repos_to_analyze:
-            print(f"❌ 未找到指定的仓库: {args.repo}")
-            return
 
+    # 计算分数并排序
     repos_ranked: List[Tuple[str, float]] = []
     for repo in repos_to_analyze:
-        key = _compute_sort_key(data[repo])
-        repos_ranked.append((repo, key))
+        score = _compute_health_score(data[repo])
+        repos_ranked.append((repo, score))
 
+    # 从大到小排序 (越大约好)
     repos_ranked.sort(key=lambda x: x[1], reverse=True)
 
     if args.top is not None:
@@ -309,12 +357,16 @@ def main():
     # 生成报告
     reports: List[str] = []
     reports.append("=" * 90)
-    reports.append("🔍 OSS 项目 Newcomer / Core-evolution 详细分析报告（优化版）")
+    reports.append("🔍 OSS 项目新人体验与核心晋升分析报告")
     reports.append("=" * 90)
     reports.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     reports.append(f"分析项目数: {len(repos_ranked)}")
     reports.append("")
 
+    # 1. 插入总览表
+    reports.append(generate_summary_table(repos_ranked, data))
+
+    # 2. 详细报告
     for repo, _ in repos_ranked:
         reports.append(generate_repo_report(repo, data[repo]))
 

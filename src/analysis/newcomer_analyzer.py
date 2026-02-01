@@ -867,6 +867,18 @@ class NewcomerAnalyzer:
             three = data.get("three_layer_analysis", {}) or {}
 
             reach_overall = reach.get("overall", {}) or {}
+            
+            # 计算风险分
+            risk_scores = [
+                (three.get("newcomer_distance", {}) or {}).get("total_score", 0),
+                (three.get("periphery_to_core_monthly", {}) or {}).get("total_score", 0),
+                (three.get("unreachable_to_all_core_rate", {}) or {}).get("total_score", 0),
+                (three.get("unreachable_to_any_core_rate", {}) or {}).get("total_score", 0),
+            ]
+            total_risk = sum(risk_scores)
+            
+            # 计算健康分 (100 - 风险分), 越高越好
+            health_score = max(0.0, 100.0 - total_risk)
 
             summary.append({
                 "repo_name": repo_name,
@@ -880,23 +892,17 @@ class NewcomerAnalyzer:
                 "overall_unreachable_to_all_core_rate": reach_overall.get("overall_unreachable_to_all_core_rate"),
                 "overall_unreachable_to_any_core_rate": reach_overall.get("overall_unreachable_to_any_core_rate"),
 
-                "three_layer_newcomer_distance_score": (three.get("newcomer_distance", {}) or {}).get("total_score"),
-                "three_layer_periphery_to_core_monthly_score": (three.get("periphery_to_core_monthly", {}) or {}).get("total_score"),
-                "three_layer_unreachable_to_all_core_rate_score": (three.get("unreachable_to_all_core_rate", {}) or {}).get("total_score"),
-                "three_layer_unreachable_to_any_core_rate_score": (three.get("unreachable_to_any_core_rate", {}) or {}).get("total_score"),
+                "three_layer_newcomer_distance_score": risk_scores[0],
+                "three_layer_periphery_to_core_monthly_score": risk_scores[1],
+                "three_layer_unreachable_to_all_core_rate_score": risk_scores[2],
+                "three_layer_unreachable_to_any_core_rate_score": risk_scores[3],
+                
+                "total_risk_score": total_risk,
+                "health_score": health_score  # 新增健康分
             })
 
-        # 默认排序：四个三层总分之和（越高信号越强/越差）
-        def _sort_key(x: Dict[str, Any]) -> float:
-            keys = [
-                "three_layer_newcomer_distance_score",
-                "three_layer_periphery_to_core_monthly_score",
-                "three_layer_unreachable_to_all_core_rate_score",
-                "three_layer_unreachable_to_any_core_rate_score",
-            ]
-            return sum(float(x.get(k) or 0.0) for k in keys)
-
-        summary.sort(key=_sort_key, reverse=True)
+        # 排序：按健康分从高到低
+        summary.sort(key=lambda x: x["health_score"], reverse=True)
 
         summary_file = self.output_dir / "summary.json"
         with open(summary_file, "w", encoding="utf-8") as f:
