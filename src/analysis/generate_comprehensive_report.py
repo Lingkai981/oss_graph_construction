@@ -1,4 +1,3 @@
-
 import json
 import re
 import math
@@ -327,12 +326,97 @@ def calc_personnel_score_raw(data: Dict[str, float]) -> float:
         score_stab = 100.0 # Perfectly stable if only one point
         
     
+def calc_personnel_score_raw(data: Dict[str, float]) -> float:
+    if not data: return 50.0
+    
+    # Sort by year keys to ensure chronological order
+    sorted_years = sorted(data.keys())
+    vals = [data[y] for y in sorted_years]
+    n = len(vals)
+    if n == 0: return 50.0
+    
+    # ---------------------------------------------------------
+    # PART 1: Magnitude / Baseline (50%)
+    # ---------------------------------------------------------
+    avg_val = sum(vals) / n
+    score_avg = max(0.0, min(100.0, 50.0 + avg_val * 2.0))
+    
+    # ---------------------------------------------------------
+    # PART 2: Trend & Dynamics
+    # ---------------------------------------------------------
+    
+    if n > 1:
+        # A. Long Term Trend (Slope) - 20%
+        xs = list(range(n))
+        x_mean = sum(xs) / n
+        y_mean = avg_val
+        numerator = sum((xs[i] - x_mean) * (vals[i] - y_mean) for i in range(n))
+        denominator = sum((xs[i] - x_mean) ** 2 for i in range(n))
+        slope = numerator / denominator if denominator != 0 else 0.0
+        
+        score_slope = max(0.0, min(100.0, 50.0 + slope * 5.0))
+        
+        # B. Recent Status (Gap) - 20%
+        gap = vals[-1] - vals[0]
+        score_gap = max(0.0, min(100.0, 50.0 + gap * 1.0))
+        
+        # C. Stability (Volatility) - 10%
+        variance = sum((x - avg_val) ** 2 for x in vals) / (n - 1)
+        std_dev = variance ** 0.5
+        score_stab = max(0.0, 100.0 - std_dev * 5.0)
+        
+    else:
+        score_slope = 50.0
+        score_gap = 50.0
+        score_stab = 100.0 
+    
     # Final Weighted Sum
     # Avg(0.5) + Slope(0.2) + Gap(0.2) + Stab(0.1)
     final_score = (score_avg * 0.50) + \
                   (score_slope * 0.20) + \
                   (score_gap * 0.20) + \
                   (score_stab * 0.10)
+                  
+    return final_score
+
+# ==========================================
+# Statistic Utils
+# ==========================================
+
+def mean(data: List[float]) -> float:
+    return sum(data) / len(data) if data else 0.0
+
+def pearson_r(x: List[float], y: List[float]) -> float:
+    n = len(x)
+    if n < 2 or n != len(y): return 0.0
+    mu_x = mean(x)
+    mu_y = mean(y)
+    numerator = sum((xi - mu_x) * (yi - mu_y) for xi, yi in zip(x, y))
+    sum_sq_x = sum((xi - mu_x) ** 2 for xi in x)
+    sum_sq_y = sum((yi - mu_y) ** 2 for yi in y)
+    denominator = (sum_sq_x * sum_sq_y) ** 0.5
+    if denominator == 0: return 0.0
+    return numerator / denominator
+
+def get_significance(r: float, n: int) -> str:
+    # t-test for pearson correlation coefficient
+    if abs(r) >= 1.0: return "***"
+    if n <= 2: return ""
+    
+    t_stat = abs(r) * ((n - 2) ** 0.5) / ((1 - r ** 2) ** 0.5)
+    
+    # Approx critical values for df around 40-50
+    # p < 0.001 ~ 3.5
+    # p < 0.01 ~ 2.68
+    # p < 0.05 ~ 2.01
+    if t_stat > 3.5: return "***" # p < 0.001
+    if t_stat > 2.68: return "**" # p < 0.01
+    if t_stat > 2.01: return "*"  # p < 0.05
+    return ""
+
+# ==========================================
+# Main
+# ==========================================
                   
     return final_score
 
@@ -398,20 +482,99 @@ def main():
     md.append("")
     md.append("本报告采用归一化评分 (Normalized)。详细月度指标覆盖倦怠、新人、氛围三大维度。")
     md.append("")
+    
+    # Econometric Analysis
+    md.append("## 📈 计量分析 (Econometric Analysis)")
+    
+    # Collect data vectors
+    vec_total = [x['total'] for x in items]
+    vec_maint = [x['norm']['b'] for x in items]
+    vec_ncomer = [x['norm']['n'] for x in items]
+    vec_atmos = [x['norm']['a'] for x in items]
+    vec_flow = [x['norm']['p'] for x in items]
+    n_samples = len(vec_total)
+    
+    md.append(f"基于 **N={n_samples}** 个样本项目的 Pearson 相关性分析。")
+    md.append("")
+    
+    # Helper to format cell
+    def fmt_corr(v1, v2):
+        r = pearson_r(v1, v2)
+        sig = get_significance(r, n_samples)
+        return f"{r:.3f}{sig}"
 
+    md.append("| 变量 (Variables) | 总分 (Total) | 🧠 维护 | 🌱 新人 | 💬 氛围 | 🌊 流动 |")
+    md.append("|---|---|---|---|---|---|")
+    
+    # Total Row
+    row_total = f"| **总分 (Total)** | 1.000 | {fmt_corr(vec_total, vec_maint)} | {fmt_corr(vec_total, vec_ncomer)} | {fmt_corr(vec_total, vec_atmos)} | {fmt_corr(vec_total, vec_flow)} |"
+    md.append(row_total)
+    
+    # Dimension Rows
+    md.append(f"| **🧠 维护 (Maint)** | {fmt_corr(vec_maint, vec_total)} | 1.000 | {fmt_corr(vec_maint, vec_ncomer)} | {fmt_corr(vec_maint, vec_atmos)} | {fmt_corr(vec_maint, vec_flow)} |")
+    md.append(f"| **🌱 新人 (Newcomer)** | {fmt_corr(vec_ncomer, vec_total)} | {fmt_corr(vec_ncomer, vec_maint)} | 1.000 | {fmt_corr(vec_ncomer, vec_atmos)} | {fmt_corr(vec_ncomer, vec_flow)} |")
+    md.append(f"| **💬 氛围 (Atmos)** | {fmt_corr(vec_atmos, vec_total)} | {fmt_corr(vec_atmos, vec_maint)} | {fmt_corr(vec_atmos, vec_ncomer)} | 1.000 | {fmt_corr(vec_atmos, vec_flow)} |")
+    md.append(f"| **🌊 流动 (Flow)** | {fmt_corr(vec_flow, vec_total)} | {fmt_corr(vec_flow, vec_maint)} | {fmt_corr(vec_flow, vec_ncomer)} | {fmt_corr(vec_flow, vec_atmos)} | 1.000 |")
+    
+    md.append("")
+    md.append("**显著性水平 (Significance Levels):** `*** p<0.001`, `** p<0.01`, `* p<0.05`")
+    md.append("")
+    md.append("**💡 关键发现 (Key Findings):**")
+    
+    # Automated Insight Generation
+    corrs = [
+        ("维护 (Maint)", pearson_r(vec_total, vec_maint)),
+        ("新人 (Newcomer)", pearson_r(vec_total, vec_ncomer)),
+        ("氛围 (Atmos)", pearson_r(vec_total, vec_atmos)),
+        ("流动 (Flow)", pearson_r(vec_total, vec_flow))
+    ]
+    # Sort by correlation strength
+    corrs.sort(key=lambda x: x[1], reverse=True)
+    
+    top_factor = corrs[0]
+    md.append(f"1. **{top_factor[0]}** 与总得分的相关性最高 (r={top_factor[1]:.3f})，说明它是拉开项目差距的关键因素。")
+    
+    # Check for trade-offs (negative correlation between dimensions)
+    trade_off_found = False
+    dim_pairs = [
+        ("维护", "新人", vec_maint, vec_ncomer),
+        ("维护", "氛围", vec_maint, vec_atmos),
+        ("维护", "流动", vec_maint, vec_flow),
+        ("新人", "氛围", vec_ncomer, vec_atmos),
+        ("新人", "流动", vec_ncomer, vec_flow),
+        ("氛围", "流动", vec_atmos, vec_flow)
+    ]
+    
+    for n1, n2, v1, v2 in dim_pairs:
+        r_val = pearson_r(v1, v2)
+        if r_val < -0.1:
+            md.append(f"2. **{n1}** 与 **{n2}** 呈现负相关 (r={r_val:.3f})，暗示这两个指标之间可能存在权衡 (Trade-off)。")
+            trade_off_found = True
+            break # Just one example is enough
+            
+    if not trade_off_found:
+        md.append("2. 各子维度之间普遍呈正相关或弱相关，说明健康的项目往往在各方面表现均衡。")
+
+    md.append("")
+    
     # Methodology Section
     md.append("## 📐 评分模型说明 (Scoring Methodology)")
     md.append("总分由四大维度构成 (**各占 25%**)，且所有分数均经过 Min-Max 归一化处理。")
+    md.append("**⚠️ 统一标准**: 所有维度的评分 (Normalized Score) 均为 **越高越好 (Higher is Better)**。")
     md.append("")
     md.append("### 1. 🧠 维护健康度 (Project Maintenance)")
     md.append("> **数据来源**: Burnout Analysis Model (Pre-calculated)")
     md.append("*   **核心指标**: 事件总量 (Events)、贡献者规模 (Contributors)、核心开发者数 (Core Actors)、网络聚类系数 (Clustering)。")
-    md.append("*   **评估逻辑**: 综合评估项目的活跃规模与核心维护团队的抗风险能力。")
+    md.append("*   **评估逻辑**: 综合评估项目的活跃规模与核心维护团队的抗风险能力 (Burnout Resilience)。")
     md.append("")
     md.append("### 2. 🌱 新人友好度 (Newcomer Friendliness)")
     md.append("> **数据来源**: Newcomer Analysis Model (Pre-calculated)")
     md.append("*   **核心指标**: 新人以晋升核心圈的平均距离 (Distance)、所需时间 (Time to Core)、以及核心不可达率 (Unreachability)。")
-    md.append("*   **评估逻辑**: 路径越短、耗时越少、核心越容易触达，分数越高。")
+    md.append("*   **评估逻辑 (关键)**: 系统自动将指标反向处理——")
+    md.append("    *   **距离 (Distance)**: 越短 -> 分数越高")
+    md.append("    *   **耗时 (Time)**: 越少 -> 分数越高")
+    md.append("    *   **不可达率 (Unreachability)**: 越低 -> 分数越高")
+    md.append("    *   *最终呈现为 Health Score (0-100)，分越高对新人越友好。*")
     md.append("")
     md.append("### 3. 💬 社区氛围 (Atmosphere)")
     md.append("*   **40% 毒性控制 (Toxicity)**: 评论中的负面/攻击性言论比例 (基准线 5% 以下)。")
@@ -432,15 +595,20 @@ def main():
     for i, item in enumerate(items, 1):
         n = item['norm']
         lvl = get_level(item['total']).split(" ")[0]
-        md.append(f"| {i} | `{item['repo']}` | **{item['total']:.1f}** | {lvl} | {n['b']:.1f} | {n['n']:.1f} | {n['a']:.1f} | {n['p']:.1f} |")
+        # Valid anchor id: replace / with - or _
+        repo_slug = item['repo'].replace("/", "_").replace(".", "_")
+        md.append(f"| {i} | [{item['repo']}](#{repo_slug}) | **{item['total']:.1f}** | {lvl} | {n['b']:.1f} | {n['n']:.1f} | {n['a']:.1f} | {n['p']:.1f} |")
         
     md.append("")
     md.append("## 📊 详细数据分析")
     
     for i, item in enumerate(items, 1):
         repo = item['repo']
+        repo_slug = repo.replace("/", "_").replace(".", "_")
+        
+        md.append(f"<div id='{repo_slug}'></div>")
         md.append(f"### {i}. {repo}")
-        md.append(f"**Score**: {item['total']:.1f} ({get_level(item['total'])})")
+        md.append(f"**Score**: {item['total']:.1f} ({get_level(item['total'])}) [⬆️ Top](#综合排名)")
         
         # Yearly Flow (Correct Order: 2021 -> 2025)
         md.append("\n**🌊 年度人员流动 (Yearly Flow)**")
@@ -461,19 +629,20 @@ def main():
             
         # Monthly Detail (Complex Table)
         md.append("\n**📅 月度全维度指标详情**")
+        md.append("<div style='width: 100%; overflow-x: auto;'>")
+        md.append("")
         
-        # Headers
-        # Burnout: Event, User, Core, Clust
-        # Newcomer: New, Dist, NewCore, Time, U-All, U-Any
-        # Atmos: Tox, Resp, Close
-        
-        # We need a condensed header to fit
-        # M | Evt | User | Core | Clst | New | Dist | NCor | Time | U-All | U-Any | Tox | Resp | Close
-        
-        md.append("| 月份 | ⚡️事件 | 👥贡献 | 🧠核心 | 🕸聚类 | 🌱新人 | 📏步长 | 🎖新核 | ⏳耗时 | 🚫All | 🚫Any | ☠️毒性 | ⏱响应 | ✅关闭 |")
+        # Headers with category icons
+        # 🧠 Burnout, 🌱 Newcomer, 💬 Atmosphere
+        md.append("| Month | 🧠Events | 🧠Users | 🧠Core | 🧠Clust | 🌱New | 🌱Dist | 🌱NewCore | 🌱Time | 🌱UnrAll | 🌱UnrAny | 💬Tox | 💬Resp | 💬Close |")
         md.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         
-        for m in item["months"]:
+        # Sort months ASCENDING (Oldest -> Newest) as requested "从21年开始往下排" (2021 top, 2025 bottom)
+        # item['months'] contains "YYYY-MM". sorting it works naturally for strings.
+        # Previously we did reverse=True (Newest top).
+        sorted_months = sorted(item["months"])
+        
+        for m in sorted_months:
              db = item["data"]["b"].get(m, {})
              dn = item["data"]["n"].get(m, {})
              da = item["data"]["a"].get(m, {})
@@ -497,6 +666,8 @@ def main():
              
              md.append(f"| {m} | {evt} | {usr} | {cor} | {cst} | {new} | {dst} | {ncr} | {tim} | {ual} | {uany} | {tox} | {rsp} | {cls} |")
              
+        md.append("")
+        md.append("</div>") # Close scrollable div
         md.append("")
         md.append("---")
         
