@@ -3,7 +3,7 @@ import json
 import re
 import math
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 from collections import defaultdict
 
@@ -18,21 +18,19 @@ BURNOUT_SUMMARY = OUTPUT_DIR / "burnout-analysis2/summary.json"
 NEWCOMER_SUMMARY = OUTPUT_DIR / "newcomer-analysis/summary.json"
 ATMOSPHERE_SUMMARY = OUTPUT_DIR / "community-atmosphere-analysis/full_analysis.json"
 
-# Detailed files for monthly data
+# Detailed files
 BURNOUT_FULL = OUTPUT_DIR / "burnout-analysis2/full_analysis.json"
 NEWCOMER_FULL = OUTPUT_DIR / "newcomer-analysis/full_analysis.json"
 ATMOSPHERE_FULL = OUTPUT_DIR / "community-atmosphere-analysis/full_analysis.json"
-
 PERSONNEL_FILE = OUTPUT_DIR / "personnel-flow-all/repo_yearly_status.txt"
 FINAL_REPORT_PATH = OUTPUT_DIR / "comprehensive_report.md"
 
 # ==========================================
-# Data Loading & Parsing
+# Parsing Logic
 # ==========================================
 
 def load_json(path: Path) -> Any:
     if not path.exists():
-        print(f"⚠️ Warning: {path} not found.")
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -40,350 +38,473 @@ def load_json(path: Path) -> Any:
 def get_level(score: float) -> str:
     if score >= 85: return "🟢 卓越"
     if score >= 70: return "🟢 良好"
-    if score >= 50: return "🟡 中等"
+    if score >= 60: return "🟡 中等" # Adjustment for reality
+    if score >= 50: return "🟡 及格"
     return "🔴 较差"
 
 def normalize(values: Dict[str, float]) -> Dict[str, float]:
-    """Min-Max normalization to 0-100 range"""
     if not values: return {}
-    
     vals = list(values.values())
-    min_v = min(vals)
-    max_v = max(vals)
-    
-    if max_v == min_v:
-        return {k: 100.0 for k in values} # All equal -> all 100
-        
-    norm = {}
-    for k, v in values.items():
-        n_val = (v - min_v) / (max_v - min_v) * 100.0
-        norm[k] = n_val
-    return norm
+    min_v, max_v = min(vals), max(vals)
+    if max_v == min_v: return {k: 100.0 for k in values}
+    return {k: (v - min_v) / (max_v - min_v) * 100.0 for k, v in values.items()}
 
-# --- 1. Burnout Parsing ---
-
+# --- Burnout ---
 def load_burnout_scores_raw() -> Dict[str, float]:
     data = load_json(BURNOUT_SUMMARY)
     if isinstance(data, list):
         return {item["repo_name"]: float(item.get("burnout_score", 0)) for item in data}
     return {}
 
-def load_burnout_monthly(repo: str, full_data: Dict) -> Dict[str, Dict]:
+def load_burnout_monthly_full(repo: str, full_data: Dict) -> Dict[str, Dict]:
+    # Need: total_events, node_count, core_actor_count, clustering_coefficient
     monthly = {}
-    # full_data keys might be 'owner/repo'
-    if repo not in full_data: 
-        # try searching? No, should be exact.
-        return monthly
+    if repo not in full_data: return monthly
     
     metrics = full_data[repo].get("metrics", [])
     for m in metrics:
         month = m.get("month")
-        core_count = m.get("core_actor_count", 0)
-        events = m.get("total_events", 0)
-        load = events / core_count if core_count > 0 else 0
-        
+        if not month: continue
         monthly[month] = {
-            "core": core_count,
-            "load": round(load, 1)
+            "events": m.get("total_events", 0),
+            "users": m.get("node_count", 0), # or unique_actors
+            "core": m.get("core_actor_count", 0),
+            "clust": round(m.get("clustering_coefficient", 0), 3)
         }
     return monthly
 
-# --- 2. Newcomer Parsing ---
-
+# --- Newcomer ---
 def load_newcomer_scores_raw() -> Dict[str, float]:
     data = load_json(NEWCOMER_SUMMARY)
     if isinstance(data, list):
         return {item["repo_name"]: float(item.get("health_score", 0)) for item in data}
     return {}
 
-def load_newcomer_monthly(repo: str, full_data: Dict) -> Dict[str, Dict]:
-    monthly = defaultdict(lambda: {"count": 0, "dist_sum": 0.0})
+def load_newcomer_monthly_full(repo: str, full_data: Dict) -> Dict[str, Dict]:
+    # Need: newcomer_count, avg_dist, new_core_count, time_to_core, unreach_all, unreach_any
+    # NOTE: The data is split across 3 monthly_summary arrays in full_analysis.json
+    # We need to scan "newcomer_distance", "periphery_to_core", "core_reachability" sections
+    
+    monthly = defaultdict(lambda: {
+        "count": 0, "dist": "-", 
+        "new_core": 0, "time_core": "-",
+        "unr_all": 0, "unr_any": 0
+    })
     
     if repo not in full_data: return monthly
     
     repo_data = full_data[repo]
-    dist_data = repo_data.get("newcomer_distance", {})
-    records = dist_data.get("records", [])
     
-    for r in records:
-        month = r.get("join_month")
-        dist = r.get("avg_shortest_path_to_core")
-        
-        if month:
-            monthly[month]["count"] += 1
-            if dist is not None:
-                monthly[month]["dist_sum"] += dist
-                
-    result = {}
-    for m, v in monthly.items():
-        avg_dist = v["dist_sum"] / v["count"] if v["count"] > 0 else 0
-        result[m] = {
-            "count": v["count"],
-            "dist": round(avg_dist, 2)
-        }
-    return result
+    # 1. Newcomer Distance & Count
+    # Stored in: repo_data["newcomer_distance"]["monthly_summary"]? 
+    # Actually based on grep:
+    # "core_reachability": { "monthly_summary": [ {month, newcomers, avg_shortest_path_to_core...} ] }
+    # This seems to have count and dist.
+    
+    cr = repo_data.get("core_reachability", {})
+    ms_cr = cr.get("monthly_summary", [])
+    if not ms_cr:
+         # Try finding in root?
+         pass
 
-# --- 3. Atmosphere Parsing ---
+    # 2. Periphery to Core
+    # "periphery_to_core": { "monthly_summary": [ {month, new_core_count, avg_months_to_core...} ] }
+    ptc = repo_data.get("periphery_to_core", {})
+    ms_ptc = ptc.get("monthly_summary", [])
+    
+    # 3. Unreachability
+    # "core_reachability" -> "monthly_summary" has `unreachable_to_all/any_core_rate`? 
+    # Check grep again:
+    # "core_reachability": { "monthly_summary": [ {month, unreachable_to_all_core_rate...} ] } (Wait, grep showed specific rates in one of the monthly_summary blocks)
+    # Actually, look at grep output for "total_actor_count ... unreachable_to_all_core_rate". That block seems like "core_reachability".
+    
+    # Merger logic
+    # We will iterate all blocks found in repo_data values that have "monthly_summary"
+    
+    # Let's target specific keys to be safe
+    
+    # Block A: Newcomer Count & Dist & Unreachability (from core_reachability.monthly_summary usually)
+    # Actually grep output showed:
+    # { month="2021-01", newcomers=100, avg_shortest_path_to_core=3.07... } -> This is likely Newcomer Distance or CoreReachability?
+    # Another block: { month="2021-01", total_actor_count=13, unreachable_to_all_core_rate=... } -> This is Core Reachability.
+    
+    # Let's try to just be robust and check expected keys in any monthly_summary list
+    
+    keys_to_check = ["core_reachability", "periphery_to_core", "newcomer_distance"]
+    
+    for k in keys_to_check:
+        section = repo_data.get(k, {})
+        ms = section.get("monthly_summary", [])
+        if not ms: continue
+        
+        for record in ms:
+            m = record.get("month")
+            if not m: continue
+            
+            # Extract whatever is present
+            if "newcomers" in record:
+                monthly[m]["count"] = record["newcomers"]
+            
+            if "avg_shortest_path_to_core" in record:
+                val = record["avg_shortest_path_to_core"]
+                if val is not None: monthly[m]["dist"] = round(val, 2)
+            
+            if "new_core_count" in record:
+                monthly[m]["new_core"] = record["new_core_count"]
+                
+            if "avg_months_to_core" in record:
+                val = record["avg_months_to_core"]
+                if val is not None: monthly[m]["time_core"] = round(val, 1)
+            elif "median_months_to_core" in record:
+                 # fallback if average is missing? User asked for "晋核耗时" -> avg is good
+                 pass
+            
+            if "unreachable_to_all_core_rate" in record:
+                val = record["unreachable_to_all_core_rate"]
+                if val is not None: monthly[m]["unr_all"] = f"{round(val*100, 1)}%"
+                
+            if "unreachable_to_any_core_rate" in record:
+                val = record["unreachable_to_any_core_rate"]
+                if val is not None: monthly[m]["unr_any"] = f"{round(val*100, 1)}%"
+                
+    return monthly
+
+# --- Atmosphere ---
 
 def load_atmosphere_scores_raw() -> Dict[str, float]:
-    full_data = load_json(ATMOSPHERE_FULL)
+    full = load_json(ATMOSPHERE_FULL)
     scores = {}
-    
-    for repo, content in full_data.items():
-        metrics = content.get("metrics", [])
+    for repo, data in full.items():
+        metrics = data.get("metrics", [])
         if not metrics:
             scores[repo] = 0.0
             continue
             
-        tox_values = [m.get("toxicity_ratio", m.get("toxic_rate_0_5", 0.0)) for m in metrics]
-        resp_values = [m.get("avg_response_time", m.get("time_to_first_response_mean", 0.0)) for m in metrics]
-        close_values = [m.get("closing_rate", m.get("change_request_closure_ratio", 0.0)) for m in metrics]
+        # Collect raw values with fallbacks
+        vals_t = []
+        vals_r = []
+        vals_c = []
         
-        # Handle Nones
-        tox_values = [v if v is not None else 0.0 for v in tox_values]
-        resp_values = [v if v is not None else 0.0 for v in resp_values]
-        close_values = [v if v is not None else 0.0 for v in close_values]
+        for m in metrics:
+            # Toxicity
+            t = m.get("toxicity_ratio")
+            if t is None: t = m.get("toxic_rate_0_5", 0)
+            vals_t.append(t)
+            
+            # Response Time
+            r = m.get("avg_response_time")
+            if r is None: r = m.get("time_to_first_response_mean", 0)
+            vals_r.append(r)
+            
+            # Closing Rate
+            c = m.get("closing_rate")
+            if c is None: c = m.get("change_request_closure_ratio", 0)
+            vals_c.append(c)
         
-        avg_tox = sum(tox_values) / len(tox_values) if tox_values else 0
-        avg_resp = sum(resp_values) / len(resp_values) if resp_values else 0
-        avg_close = sum(close_values) / len(close_values) if close_values else 0
+        avg_t = sum(vals_t)/len(vals_t) if vals_t else 0
+        avg_r = sum(vals_r)/len(vals_r) if vals_r else 0
+        avg_c = sum(vals_c)/len(vals_c) if vals_c else 0
         
-        s1 = max(0.0, 1.0 - avg_tox / 0.05) * 100 * 0.4
-        s2 = (100.0 / (1.0 + avg_resp / 48.0)) * 0.3
-        s3 = min(100.0, avg_close * 100.0) * 0.3 # close is usually 0.0-1.0
+        # 1. Toxicity (40pts) - Lower is better
+        # 0 -> 40pts; 0.05 -> 0pts
+        s1 = max(0.0, 1.0 - avg_t/0.05) * 40.0
+        
+        # 2. Response Time (30pts) - Lower is better
+        # 0h -> 30pts; 48h -> 15pts
+        s2 = (1.0 / (1.0 + avg_r/48.0)) * 30.0
+        
+        # 3. Closing Rate (30pts) - Higher is better
+        # 1.0 -> 30pts
+        s3 = min(1.0, avg_c) * 30.0
         
         scores[repo] = s1 + s2 + s3
     return scores
 
-def load_atmosphere_monthly(repo: str, full_data: Dict) -> Dict[str, Dict]:
+def load_atmosphere_monthly_full(repo: str, full_data: Dict) -> Dict[str, Dict]:
+    # Need: toxicity, response_time, closing_rate
     monthly = {}
     if repo not in full_data: return monthly
     
     metrics = full_data[repo].get("metrics", [])
     for m in metrics:
         month = m.get("month")
-        tox = m.get("toxicity_ratio", m.get("toxic_rate_0_5", 0))
-        resp = m.get("avg_response_time", m.get("time_to_first_response_mean", 0))
-        close = m.get("closing_rate", m.get("change_request_closure_ratio", 0))
+        if not month: continue
+        
+        tox = m.get("toxicity_ratio")
+        if tox is None: tox = m.get("toxic_rate_0_5", 0)
+        
+        resp = m.get("avg_response_time")
+        if resp is None: resp = m.get("time_to_first_response_mean", 0)
+        
+        close = m.get("closing_rate")
+        if close is None: close = m.get("change_request_closure_ratio", 0)
         
         monthly[month] = {
-            "tox": round(tox, 3) if tox is not None else 0,
-            "resp": round(resp, 1) if resp is not None else 0,
-            "close": round(close * 100, 1) if close is not None else 0
+            "tox": round(tox, 4),
+            "resp": round(resp, 1),
+            "close": f"{round(close*100, 1)}%"
         }
     return monthly
 
-# --- 4. Personnel Parsing ---
+# --- Personnel ---
 
 def load_personnel_data() -> Dict[str, Dict[str, float]]:
-    result = defaultdict(dict)
+    data = defaultdict(dict)
+    if not PERSONNEL_FILE.exists(): return data
     
-    if not PERSONNEL_FILE.exists():
-        return result
-        
-    with open(PERSONNEL_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    with open(PERSONNEL_FILE, "r") as f: lines = f.readlines()
     
-    # Relaxed Regex
-    # Match "[ 2024 年度状态 ]" or similar
-    year_pattern = re.compile(r"\[\s*(\d{4})\s*年度状态")
-    # Matches: "  repo_name  : 净增 +XX.X% ..."
-    repo_pattern = re.compile(r"^\s+([a-zA-Z0-9\-\_\./]+)\s+:\s+净[增流].*?([+\-]?\d+\.?\d*)%")
+    yr_pat = re.compile(r"\[\s*(\d{4})")
+    # Supports both "净增 +10%" and "净 +10%" formats
+    repo_pat = re.compile(r"^\s+([a-zA-Z0-9\-\_\./]+)\s+:\s+净(?:[增流])?\s*([+\-]?\d+\.?\d*)%")
     
-    current_year = None
-    
+    curr_yr = None
     for line in lines:
-        ym = year_pattern.search(line)
-        if ym:
-            current_year = ym.group(1)
+        ym = yr_pat.search(line)
+        if ym: 
+            curr_yr = ym.group(1)
             continue
-            
-        rm = repo_pattern.search(line)
-        if rm and current_year:
+        
+        rm = repo_pat.search(line)
+        if rm and curr_yr:
             repo = rm.group(1).strip()
-            pct_val = float(rm.group(2))
-            result[repo][current_year] = pct_val
-            
-    return result
+            val = float(rm.group(2))
+            data[repo][curr_yr] = val
+    return data
 
-def calculate_personnel_score_raw(yearly_data: Dict[str, float]) -> float:
-    if not yearly_data: return 50.0
-    vals = yearly_data.values()
-    avg_pct = sum(vals) / len(vals)
-    score = 50.0 + (avg_pct / 2.0)
-    return max(0.0, min(100.0, score))
-
+def calc_personnel_score_raw(data: Dict[str, float]) -> float:
+    if not data: return 50.0
+    
+    # Sort by year keys to ensure chronological order
+    sorted_years = sorted(data.keys())
+    vals = [data[y] for y in sorted_years]
+    n = len(vals)
+    if n == 0: return 50.0
+    
+    # ---------------------------------------------------------
+    # PART 1: Magnitude / Baseline (50%)
+    # "Positive average definitely better than negative"
+    # ---------------------------------------------------------
+    avg_val = sum(vals) / n
+    # Mapping: +25% avg -> 100pts, 0% -> 50pts, -25% avg -> 0pts
+    score_avg = max(0.0, min(100.0, 50.0 + avg_val * 2.0))
+    
+    # ---------------------------------------------------------
+    # PART 2: Trend & Dynamics (50% Shared)
+    # Ratio 4:4:2 -> Slope(0.2) : Gap(0.2) : Stability(0.1)
+    # ---------------------------------------------------------
+    
+    if n > 1:
+        # A. Long Term Trend (Slope) - 20%
+        xs = list(range(n))
+        x_mean = sum(xs) / n
+        y_mean = avg_val
+        numerator = sum((xs[i] - x_mean) * (vals[i] - y_mean) for i in range(n))
+        denominator = sum((xs[i] - x_mean) ** 2 for i in range(n))
+        slope = numerator / denominator if denominator != 0 else 0.0
+        
+        # Slope +5 per year -> +25 pts -> 75
+        score_slope = max(0.0, min(100.0, 50.0 + slope * 5.0))
+        
+        # B. Recent Status (Gap) - 20%
+        # "Gap between newest and oldest"
+        gap = vals[-1] - vals[0]
+        # Gap +20% -> +20pts -> 70
+        score_gap = max(0.0, min(100.0, 50.0 + gap * 1.0))
+        
+        # C. Stability (Volatility) - 10%
+        # "Volatility" -> Standard Deviation
+        variance = sum((x - avg_val) ** 2 for x in vals) / (n - 1)
+        std_dev = variance ** 0.5
+        # StdDev 0 -> 100 pts
+        # StdDev 20 -> 0 pts (Highly volatile)
+        score_stab = max(0.0, 100.0 - std_dev * 5.0)
+        
+    else:
+        # Single data point fallback
+        score_slope = 50.0
+        score_gap = 50.0
+        score_stab = 100.0 # Perfectly stable if only one point
+        
+    
+    # Final Weighted Sum
+    # Avg(0.5) + Slope(0.2) + Gap(0.2) + Stab(0.1)
+    final_score = (score_avg * 0.50) + \
+                  (score_slope * 0.20) + \
+                  (score_gap * 0.20) + \
+                  (score_stab * 0.10)
+                  
+    return final_score
 
 # ==========================================
-# Main Execution
+# Main
 # ==========================================
 
 def main():
-    print("⏳ Loading datasets...")
+    print("⏳ Loading full datasets...")
+    f_burn = load_json(BURNOUT_FULL)
+    f_new = load_json(NEWCOMER_FULL)
+    f_atm = load_json(ATMOSPHERE_FULL)
+    d_flow = load_personnel_data()
     
-    # 1. Load Data
-    full_burnout = load_json(BURNOUT_FULL)
-    full_newcomer = load_json(NEWCOMER_FULL)
-    full_atmosphere = load_json(ATMOSPHERE_FULL)
-    flow_data = load_personnel_data()
+    # Scores
+    r_burn = load_burnout_scores_raw()
+    r_new = load_newcomer_scores_raw()
+    r_atm = load_atmosphere_scores_raw()
+    r_per = {r: calc_personnel_score_raw(d_flow.get(r, {})) for r in 
+             (set(r_burn)|set(r_new)|set(r_atm)|set(d_flow))}
     
-    # 2. Extract Raw Scores
-    raw_burn = load_burnout_scores_raw()
-    raw_new = load_newcomer_scores_raw()
-    raw_atm = load_atmosphere_scores_raw()
-    raw_per = {}
+    # Normalize
+    n_burn = normalize(r_burn)
+    n_new = normalize(r_new)
+    n_atm = normalize(r_atm)
+    n_per = normalize(r_per)
     
-    all_repos = set(raw_burn.keys()) | set(raw_new.keys()) | set(raw_atm.keys()) | set(flow_data.keys())
-    
-    for repo in all_repos:
-        raw_per[repo] = calculate_personnel_score_raw(flow_data.get(repo, {}))
-        
-    # 3. Normalize Scores (Min-Max to 0-100)
-    norm_burn = normalize(raw_burn)
-    norm_new = normalize(raw_new)
-    norm_atm = normalize(raw_atm)
-    norm_per = normalize(raw_per)
-    
-    # 4. Build Report Items
-    report_items = []
+    # Build
+    items = []
+    all_repos = sorted(list(r_per.keys()))
     
     for repo in all_repos:
-        # Normalized scores used for TOTAL
-        n_b = norm_burn.get(repo, 0.0)
-        n_n = norm_new.get(repo, 0.0)
-        n_a = norm_atm.get(repo, 0.0)
-        n_p = norm_per.get(repo, 50.0) # Default mid
+        # Total Score
+        nb = n_burn.get(repo, 0)
+        nn = n_new.get(repo, 0)
+        na = n_atm.get(repo, 0)
+        np_ = n_per.get(repo, 50)
+        total = (nb+nn+na+np_)/4.0
         
-        # Raw scores used for DISPLAY (to explain reality)
-        r_b = raw_burn.get(repo, 0)
-        r_n = raw_new.get(repo, 0)
-        r_a = raw_atm.get(repo, 0)
-        r_p = raw_per.get(repo, 50)
+        # Monthly details
+        mb = load_burnout_monthly_full(repo, f_burn)
+        mn = load_newcomer_monthly_full(repo, f_new)
+        ma = load_atmosphere_monthly_full(repo, f_atm)
         
-        total = (n_b * 0.25) + (n_n * 0.25) + (n_a * 0.25) + (n_p * 0.25)
+        months = sorted(set(mb.keys()) | set(mn.keys()) | set(ma.keys()), reverse=True)
         
-        # Detailed data
-        m_burn = load_burnout_monthly(repo, full_burnout)
-        m_new = load_newcomer_monthly(repo, full_newcomer)
-        m_atm = load_atmosphere_monthly(repo, full_atmosphere)
-        yearly_flow = flow_data.get(repo, {})
-        
-        all_months = sorted(set(m_burn.keys()) | set(m_new.keys()) | set(m_atm.keys()))
-        
-        report_items.append({
+        items.append({
             "repo": repo,
             "total": total,
-            # We store raw scores for display
-            "raw": {"burn": r_b, "new": r_n, "atm": r_a, "per": r_p},
-            "norm": {"burn": n_b, "new": n_n, "atm": n_a, "per": n_p},
-            "months": all_months,
-            "data_burn": m_burn,
-            "data_new": m_new,
-            "data_atm": m_atm,
-            "data_flow": yearly_flow
+            "norm": {"b": nb, "n": nn, "a": na, "p": np_},
+            "raw": {"b": r_burn.get(repo,0), "n": r_new.get(repo,0), "a": r_atm.get(repo,0), "p": r_per.get(repo,50)},
+            "flow": d_flow.get(repo, {}),
+            "months": months,
+            "data": {"b": mb, "n": mn, "a": ma}
         })
         
-    report_items.sort(key=lambda x: x["total"], reverse=True)
+    items.sort(key=lambda x: x["total"], reverse=True)
     
-    # 5. Generate Markdown
+    # Write Markdown
     md = []
     md.append("# 📈 OSS 项目全维度深度健康报告")
     md.append(f"> 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     md.append("")
-    md.append("本报告采用 **归一化评分 (Normalized Scoring)** 机制。") 
-    md.append("原始指标经过 Min-Max 归一化处理后，加权计算总分 (各维度 25%)。")
-    md.append("**表格中展示分为： `归一化分 (原始分)`**")
+    md.append("本报告采用归一化评分 (Normalized)。详细月度指标覆盖倦怠、新人、氛围三大维度。")
+    md.append("")
+
+    # Methodology Section
+    md.append("## 📐 评分模型说明 (Scoring Methodology)")
+    md.append("总分由四大维度构成 (**各占 25%**)，且所有分数均经过 Min-Max 归一化处理。")
+    md.append("")
+    md.append("### 1. 🧠 维护健康度 (Project Maintenance)")
+    md.append("> **数据来源**: Burnout Analysis Model (Pre-calculated)")
+    md.append("*   **核心指标**: 事件总量 (Events)、贡献者规模 (Contributors)、核心开发者数 (Core Actors)、网络聚类系数 (Clustering)。")
+    md.append("*   **评估逻辑**: 综合评估项目的活跃规模与核心维护团队的抗风险能力。")
+    md.append("")
+    md.append("### 2. 🌱 新人友好度 (Newcomer Friendliness)")
+    md.append("> **数据来源**: Newcomer Analysis Model (Pre-calculated)")
+    md.append("*   **核心指标**: 新人以晋升核心圈的平均距离 (Distance)、所需时间 (Time to Core)、以及核心不可达率 (Unreachability)。")
+    md.append("*   **评估逻辑**: 路径越短、耗时越少、核心越容易触达，分数越高。")
+    md.append("")
+    md.append("### 3. 💬 社区氛围 (Atmosphere)")
+    md.append("*   **40% 毒性控制 (Toxicity)**: 评论中的负面/攻击性言论比例 (基准线 5% 以下)。")
+    md.append("*   **30% 响应效率 (Response)**: Issue/PR 的首次响应时间 (基准线 48h 以内)。")
+    md.append("*   **30% 问题解决 (Resolution)**: Issue/PR 的关闭率/解决率。")
+    md.append("")
+    md.append("### 4. 🌊 人员流动 (Personnel Flow)")
+    md.append("*   **50% 长期均值 (Magnitude)**: 2021-2025 历年平均净增长率。")
+    md.append("*   **20% 长期趋势 (Slope)**: 增长率的线性回归斜率 (考察是在变好还是变坏)。")
+    md.append("*   **20% 近期演变 (Gap)**: 最新状态相对于初始状态的改变量 (Last - First)。")
+    md.append("*   **10% 稳定性 (Stability)**: 增长的一致性 (正增长年份比例) 与 波动率 (标准差惩罚)。")
     md.append("")
     
-    md.append("## 🏆 综合排名总览")
-    md.append("| 排名 | 项目 | 总分 | 等级 | 🧠 维护(Norm) | 🌱 新人(Norm) | 💬 氛围(Norm) | 🌊 流动(Norm) |")
+    # 1. Summary
+    md.append("## 🏆 综合排名")
+    md.append("| 排名 | 项目 | 总分 | 等级 | 🧠 维护(N) | 🌱 新人(N) | 💬 氛围(N) | 🌊 流动(N) |")
     md.append("|---|---|---|---|---|---|---|---|")
-    
-    for i, item in enumerate(report_items, 1):
-        n = item["norm"]
-        r = item["raw"]
-        level = get_level(item["total"]).split(" ")[0]
-        
-        # Format: 85.1
-        f_b = f"{n['burn']:.1f}"
-        f_n = f"{n['new']:.1f}"
-        f_a = f"{n['atm']:.1f}"
-        f_p = f"{n['per']:.1f}"
-        
-        md.append(f"| {i} | `{item['repo']}` | **{item['total']:.1f}** | {level} | {f_b} | {f_n} | {f_a} | {f_p} |")
+    for i, item in enumerate(items, 1):
+        n = item['norm']
+        lvl = get_level(item['total']).split(" ")[0]
+        md.append(f"| {i} | `{item['repo']}` | **{item['total']:.1f}** | {lvl} | {n['b']:.1f} | {n['n']:.1f} | {n['a']:.1f} | {n['p']:.1f} |")
         
     md.append("")
-    md.append("## 📊 项目深入分析")
+    md.append("## 📊 详细数据分析")
     
-    for i, item in enumerate(report_items, 1):
+    for i, item in enumerate(items, 1):
         repo = item['repo']
-        n = item['norm']
-        r = item['raw']
-        
         md.append(f"### {i}. {repo}")
-        md.append(f"**总分**: {item['total']:.1f} | **等级**: {get_level(item['total'])}")
-        md.append(f"> **各维得分(原始/归一化)**:")
-        md.append(f"- 🧠 维护: Raw {r['burn']:.1f} ➔ Norm **{n['burn']:.1f}**")
-        md.append(f"- 🌱 新人: Raw {r['new']:.1f} ➔ Norm **{n['new']:.1f}**")
-        md.append(f"- 💬 氛围: Raw {r['atm']:.1f} ➔ Norm **{n['atm']:.1f}**")
-        md.append(f"- 🌊 流动: Raw {r['per']:.1f} ➔ Norm **{n['per']:.1f}**")
+        md.append(f"**Score**: {item['total']:.1f} ({get_level(item['total'])})")
         
-        # Yearly Flow
-        md.append("\n**🌊 年度人员流动 (Yearly Personnel Flow)**\n")
-        if item["data_flow"]:
-            md.append("| 年份 | 净增长率 (Net Growth) | 状态 |")
+        # Yearly Flow (Correct Order: 2021 -> 2025)
+        md.append("\n**🌊 年度人员流动 (Yearly Flow)**")
+        if item['flow']:
+            md.append("| 年份 | 净增长 (Net) | 状态 |")
             md.append("|---|---|---|")
-            # Sort years descending (newest first)
-            sorted_years = sorted(item["data_flow"].keys(), reverse=True)
-            for y in sorted_years:
-                val = item["data_flow"][y]
-                status = "🟢 流入" if val > 0 else ("🔴 流失" if val < 0 else "⚪️ 持平")
-                if val > 15: status += " (磁铁型)"
-                elif val < -15: status += " (输血型)"
-                
-                # Check for +0.0 or -0.0
-                fmt_val = f"+{val:.1f}" if val > 0 else f"{val:.1f}"
-                if val == 0: fmt_val = "0.0"
-                
-                md.append(f"| {y} | **{fmt_val}%** | {status} |")
+            yrs = sorted(item['flow'].keys()) # Default is ASC string sort "2021"..."2025"
+            for y in yrs:
+                val = item['flow'][y]
+                st = "🟢 流入" if val > 0 else "🔴 流失"
+                if val == 0: st = "⚪️ 平衡"
+                if val > 15: st += " (磁铁)"
+                elif val < -15: st += " (输血)"
+                fmt = f"+{val:.1f}" if val > 0 else f"{val:.1f}"
+                md.append(f"| {y} | **{fmt}%** | {st} |")
         else:
-             md.append("*暂无年度数据*")
+            md.append("*暂无年度数据*")
+            
+        # Monthly Detail (Complex Table)
+        md.append("\n**📅 月度全维度指标详情**")
+        
+        # Headers
+        # Burnout: Event, User, Core, Clust
+        # Newcomer: New, Dist, NewCore, Time, U-All, U-Any
+        # Atmos: Tox, Resp, Close
+        
+        # We need a condensed header to fit
+        # M | Evt | User | Core | Clst | New | Dist | NCor | Time | U-All | U-Any | Tox | Resp | Close
+        
+        md.append("| 月份 | ⚡️事件 | 👥贡献 | 🧠核心 | 🕸聚类 | 🌱新人 | 📏步长 | 🎖新核 | ⏳耗时 | 🚫All | 🚫Any | ☠️毒性 | ⏱响应 | ✅关闭 |")
+        md.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        
+        for m in item["months"]:
+             db = item["data"]["b"].get(m, {})
+             dn = item["data"]["n"].get(m, {})
+             da = item["data"]["a"].get(m, {})
              
-        # Monthly
-        md.append("\n**📅 月度指标详情 (Monthly Metrics)**\n")
-        md.append("| 月份 | 🧠 核心人数 | 🧠 人均负荷 | 🌱 新人数量 | 🌱 平均距离 | 💬 毒性 | 💬 响应(h) | 💬 关闭率 |")
-        md.append("|---|---|---|---|---|---|---|---|")
-        
-        rev_months = sorted(item["months"], reverse=True)
-        
-        for m in rev_months:
-            if not m: continue
-            
-            d_b = item["data_burn"].get(m, {})
-            d_n = item["data_new"].get(m, {})
-            d_a = item["data_atm"].get(m, {})
-            
-            core = d_b.get("core", "-")
-            load = d_b.get("load", "-")
-            
-            new_cnt = d_n.get("count", "-")
-            dist = d_n.get("dist", "-")
-            
-            tox = d_a.get("tox", "-")
-            resp = d_a.get("resp", "-")
-            close = d_a.get("close", "-")
-            if close != "-": close = f"{close}%"
-            
-            md.append(f"| {m} | {core} | {load} | {new_cnt} | {dist} | {tox} | {resp} | {close} |")
-            
+             # Extract safely
+             evt = db.get("events", "-")
+             usr = db.get("users", "-")
+             cor = db.get("core", "-")
+             cst = db.get("clust", "-")
+             
+             new = dn.get("count", "-")
+             dst = dn.get("dist", "-")
+             ncr = dn.get("new_core", "-") # 0 is valid, so check existence? defaultdict returns 0
+             tim = dn.get("time_core", "-")
+             ual = dn.get("unr_all", "-")
+             uany = dn.get("unr_any", "-")
+             
+             tox = da.get("tox", "-")
+             rsp = da.get("resp", "-")
+             cls = da.get("close", "-")
+             
+             md.append(f"| {m} | {evt} | {usr} | {cor} | {cst} | {new} | {dst} | {ncr} | {tim} | {ual} | {uany} | {tox} | {rsp} | {cls} |")
+             
         md.append("")
         md.append("---")
-
-    print("💾 Writing Markdown...")
+        
+    print("💾 Saving Report...")
     with open(FINAL_REPORT_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(md))
         
-    print(f"✅ Detailed & Normalized report generated at: {FINAL_REPORT_PATH}")
+    print(f"✅ Success: {FINAL_REPORT_PATH}")
 
 if __name__ == "__main__":
     main()
