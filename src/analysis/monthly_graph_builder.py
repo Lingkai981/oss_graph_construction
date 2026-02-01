@@ -694,10 +694,31 @@ def build_actor_discussion_graph(
 
 # ==================== 主流程 ====================
 
+def _filter_months(
+    monthly_repo_data: Dict[str, Dict[str, List[Dict]]],
+    start_month: Optional[str] = None,
+    end_month: Optional[str] = None,
+) -> Dict[str, Dict[str, List[Dict]]]:
+    """按月份范围过滤"""
+    if not start_month and not end_month:
+        return monthly_repo_data
+    filtered = {}
+    for month, repos in monthly_repo_data.items():
+        if start_month and month < start_month:
+            continue
+        if end_month and month > end_month:
+            continue
+        filtered[month] = repos
+    return filtered
+
+
 def build_monthly_graphs(
     data_dir: str = "data/filtered/",
     output_dir: str = "output/monthly-graphs/",
     graph_types: List[str] = None,
+    start_month: Optional[str] = None,
+    end_month: Optional[str] = None,
+    merge_index: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, str]]]:
     """
     构建所有项目的月度图（三类）
@@ -706,6 +727,9 @@ def build_monthly_graphs(
         data_dir: 输入数据目录
         output_dir: 输出目录
         graph_types: 要构建的图类型，默认全部 ["actor-actor", "actor-repo", "actor-discussion"]
+        start_month: 只构建该月及之后的图 (YYYY-MM)
+        end_month: 只构建该月及之前的图 (YYYY-MM)
+        merge_index: 若输出目录已有 index.json，是否合并而非覆盖
     
     Returns:
         {repo_name: {graph_type: {month: graph_path}}}
@@ -730,6 +754,11 @@ def build_monthly_graphs(
     # 按月和项目分组
     print("按月和项目分组...")
     monthly_repo_data = group_by_month_and_repo(daily_data)
+    
+    # 按月份范围过滤
+    if start_month or end_month:
+        monthly_repo_data = _filter_months(monthly_repo_data, start_month, end_month)
+        print(f"月份过滤: {start_month or '不限'} ~ {end_month or '不限'}，共 {len(monthly_repo_data)} 个月")
     
     # 统计
     total_combos = sum(len(repos) for repos in monthly_repo_data.values())
@@ -822,10 +851,21 @@ def build_monthly_graphs(
     print(f"  涉及项目: {len(result)} 个")
     print("=" * 60)
     
-    # 保存索引
+    # 保存索引（若已有则合并）
     index_file = output_path / "index.json"
+    to_save = {k: dict(v) for k, v in result.items()}
+    if merge_index and index_file.exists():
+        with open(index_file, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        for repo, graph_types_dict in to_save.items():
+            if repo not in existing:
+                existing[repo] = {}
+            for gt, months in graph_types_dict.items():
+                existing[repo].setdefault(gt, {}).update(months)
+        to_save = existing
+        print(f"已合并到现有索引")
     with open(index_file, "w", encoding="utf-8") as f:
-        json.dump({k: dict(v) for k, v in result.items()}, f, indent=2, ensure_ascii=False)
+        json.dump(to_save, f, indent=2, ensure_ascii=False)
     
     print(f"索引已保存: {index_file}")
     
@@ -878,6 +918,9 @@ def build_monthly_graphs_parallel(
     output_dir: str = "output/monthly-graphs/",
     graph_types: List[str] = None,
     workers: int = 4,
+    start_month: Optional[str] = None,
+    end_month: Optional[str] = None,
+    merge_index: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, str]]]:
     """
     并行构建所有项目的月度图
@@ -895,6 +938,11 @@ def build_monthly_graphs_parallel(
     
     print("按月和项目分组...")
     monthly_repo_data = group_by_month_and_repo(daily_data)
+    
+    # 按月份范围过滤
+    if start_month or end_month:
+        monthly_repo_data = _filter_months(monthly_repo_data, start_month, end_month)
+        print(f"月份过滤: {start_month or '不限'} ~ {end_month or '不限'}，共 {len(monthly_repo_data)} 个月")
     
     # 准备所有任务
     tasks = []
@@ -934,10 +982,21 @@ def build_monthly_graphs_parallel(
     print(f"  涉及项目: {len(result)} 个")
     print("=" * 60)
     
-    # 保存索引
+    # 保存索引（若已有则合并）
     index_file = output_path / "index.json"
+    to_save = {k: dict(v) for k, v in result.items()}
+    if merge_index and index_file.exists():
+        with open(index_file, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        for repo, graph_types_dict in to_save.items():
+            if repo not in existing:
+                existing[repo] = {}
+            for gt, months in graph_types_dict.items():
+                existing[repo].setdefault(gt, {}).update(months)
+        to_save = existing
+        print(f"已合并到现有索引")
     with open(index_file, "w", encoding="utf-8") as f:
-        json.dump({k: dict(v) for k, v in result.items()}, f, indent=2, ensure_ascii=False)
+        json.dump(to_save, f, indent=2, ensure_ascii=False)
     
     print(f"索引已保存: {index_file}")
     
@@ -974,6 +1033,23 @@ if __name__ == "__main__":
         action="store_true",
         help="使用串行模式（默认使用并行）"
     )
+    parser.add_argument(
+        "--start-month",
+        type=str,
+        default=None,
+        help="只构建该月及之后的图 (YYYY-MM，如 2020-01)"
+    )
+    parser.add_argument(
+        "--end-month",
+        type=str,
+        default=None,
+        help="只构建该月及之前的图 (YYYY-MM，如 2020-12)"
+    )
+    parser.add_argument(
+        "--no-merge-index",
+        action="store_true",
+        help="不合并到现有索引，直接覆盖（默认会合并）"
+    )
     
     args = parser.parse_args()
     
@@ -982,16 +1058,21 @@ if __name__ == "__main__":
     print(f"数据目录: {args.data_dir}")
     print(f"输出目录: {args.output_dir}")
     print(f"图类型: {args.graph_types}")
+    print(f"月份范围: {args.start_month or '不限'} ~ {args.end_month or '不限'}")
     print(f"模式: {'串行' if args.serial else f'并行 ({args.workers} 进程)'}")
     print("=" * 60)
     
     graph_types = [t.strip() for t in args.graph_types.split(",")]
+    merge_index = not args.no_merge_index
     
     if args.serial:
         build_monthly_graphs(
             data_dir=args.data_dir,
             output_dir=args.output_dir,
             graph_types=graph_types,
+            start_month=args.start_month,
+            end_month=args.end_month,
+            merge_index=merge_index,
         )
     else:
         build_monthly_graphs_parallel(
@@ -999,4 +1080,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             graph_types=graph_types,
             workers=args.workers,
+            start_month=args.start_month,
+            end_month=args.end_month,
+            merge_index=merge_index,
         )

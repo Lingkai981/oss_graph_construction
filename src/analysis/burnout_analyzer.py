@@ -148,7 +148,9 @@ class BurnoutAnalyzer:
     def load_graph(self, graph_path: str) -> Optional[nx.MultiDiGraph]:
         """加载图"""
         try:
-            graph = nx.read_graphml(graph_path)
+            # 兼容 Windows 生成的 index（路径使用反斜杠），在 Unix 上需规范化为正斜杠
+            normalized_path = Path(graph_path.replace("\\", "/"))
+            graph = nx.read_graphml(normalized_path)
             # 确保返回 MultiDiGraph
             if isinstance(graph, nx.MultiDiGraph):
                 return graph

@@ -11,7 +11,8 @@
 │  1. 数据采集        从 GitHub Archive 下载并过滤代表性项目数据    │
 │  2. 三类图构建      Actor-Actor / Actor-Repo / Actor-Discussion  │
 │  3. 倦怠分析        三层架构评分 + 多维度预警                     │
-│  4. 详细报告        按项目输出完整分析过程                        │
+│  4. 人员流动        核心成员流入流出、任期、留存率分析             │
+│  5. 详细报告        按项目输出完整分析过程                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -30,40 +31,109 @@ pip install -r requirements.txt
 如果需要采集新数据：
 
 ```bash
-# 下载 2023-2025 年数据（月采样模式，约 36GB）
+# 方式一：按预设代表性项目列表下载（--project-count 控制数量）
 python -m src.data_collection.gharchive_collector \
-  --start-date 2023-01-01 \
-  --end-date 2025-12-31 \
-  --sample-mode monthly \
+  --start-date YYYY-MM-DD \
+  --end-date YYYY-MM-DD \
+  --sample-mode fulldaily \
+  --workers 16 \
+  --output-dir data/filtered
+
+# 方式二：按已有月度图索引中的仓库列表下载（用于扩展历史或补充数据）
+python -m src.data_collection.gharchive_collector \
+  --start-date YYYY-MM-DD \
+  --end-date YYYY-MM-DD \
+  --sample-mode fulldaily \
+  --repos-from-index output/monthly-graphs/index.json \
   --output-dir data/filtered
 ```
+
+python3 -m src.data_collection.gharchive_collector \
+  --start-date 2021-02-25 --end-date 2025-12-31 \
+  --sample-mode fulldaily \
+  --workers 32 \
+  --repos-from-index output/monthly-graphs2/index.json \
+  --output-dir /Users/milk/test_data/ali2025/filtered_union_2021_2025_fulldaily
+
+采样模式说明：`fulldaily` = 每天 24 小时全量采集，按日合并为 1 个 JSON；`daily` = 每天 1 小时；`monthly` = 每月 1 小时（数据量小）
 
 ### 3. 构建月度图
 
 ```bash
+# 构建全部月份
 python -m src.analysis.monthly_graph_builder \
   --data-dir data/filtered \
   --output-dir output/monthly-graphs \
   --workers 4
+
+# 仅构建指定月份范围，并合并到已有输出目录（增量构建）
+python -m src.analysis.monthly_graph_builder \
+  --data-dir data/filtered \
+  --output-dir output/monthly-graphs \
+  --start-month YYYY-MM \
+  --end-month YYYY-MM \
+  --workers 4
 ```
+
+输出目录已存在 `index.json` 时，新构建的图会自动合并进索引，而不会覆盖已有数据。
 
 ### 4. 运行倦怠分析
 
 ```bash
 python -m src.analysis.burnout_analyzer \
-  --graphs-dir output/monthly-graphs \
-  --output-dir output/burnout-analysis
+  --graphs-dir output/monthly-graphs2 \
+  --output-dir output/burnout-analysis2
 ```
 
 ### 5. 查看详细报告
 
 ```bash
+python -m src.analysis.detailed_report \
+  --input output/burnout-analysis2/full_analysis.json \
+  --output my_report.txt
+
 # 查看前 10 个高风险项目
 python -m src.analysis.detailed_report --top 10
 
 # 查看指定项目
 python -m src.analysis.detailed_report --repo "kubernetes/kubernetes"
 ```
+
+### 6. 人员流动分析
+
+基于倦怠分析结果，研究各 repo 人员流动情况。支持两种分析范围：
+
+- **核心成员（默认）**：仅分析贡献约前 50% 的核心成员
+- **全部贡献者**：分析所有参与过项目的贡献者（需指定月度图目录）
+
+```bash
+# 核心成员版（默认）
+python -m src.analysis.personnel_flow \
+  --input output/burnout-analysis2/full_analysis.json \
+  --output-dir output/personnel-flow
+
+# 全部贡献者版（--graphs-dir 需与 burnout 分析使用的图目录一致）
+python -m src.analysis.personnel_flow \
+  --scope all \
+  --graphs-dir output/monthly-graphs2 \
+  --input output/burnout-analysis2/full_analysis.json
+```
+
+`--scope all` 时输出到 `output/personnel-flow-all/`（可用 `--output-dir` 覆盖）。
+
+输出包括：
+- **personnel_flow.json**：完整流动数据（含 flowed_to 流向信息）
+- **summary_report.txt**：按关键流失排序的摘要
+- **leave_events_detail.txt**：全部流失明细（每条离开事件及流向）
+- **flow_statistics.txt**：Repo→Repo 流向统计（从哪流向哪的人数排序）
+- **flow_by_year.txt**：按年统计流向 + 流入最多的目标 Repo 排名
+- **flow_timeline.txt**：人才流动时间线（按时间顺序，每月离开明细及汇总）
+- **repo_trend.txt**：Repo 流行趋势（按前半段 vs 后半段活跃度判断上升/下降/平稳）
+- **cross_repo_flow.txt**：跨 repo 流向专题（有流向的关键流失明细）
+
+分析维度：核心成员时间线、流入/流出事件、任期分布、关键流失、N 个月留存率、**跨 repo 流向**（离开后 12 个月内于其他项目成为核心）。
+
+**「离开」含义**：某月不再处于该 repo 核心成员名单（贡献跌出前约 50%），不表示完全不参与，可能是参与减少、完全退出或角色变化。
 
 ---
 
@@ -81,7 +151,7 @@ python -m src.analysis.detailed_report --repo "kubernetes/kubernetes"
 ```
 GitHub Archive 事件数据
     ↓
-按月聚合（2023-01, 2023-02, ...）
+按月聚合（YYYY-MM, ...）
     ↓
 按项目分组
     ↓
@@ -351,6 +421,7 @@ oss_graph_construction/
 │   ├── analysis/                    # 分析模块
 │   │   ├── monthly_graph_builder.py # 月度图构建
 │   │   ├── burnout_analyzer.py      # 倦怠分析
+│   │   ├── personnel_flow.py        # 人员流动分析
 │   │   └── detailed_report.py       # 详细报告生成
 │   ├── data_collection/             # 数据采集
 │   │   ├── gharchive_collector.py   # GitHub Archive 下载器
@@ -368,11 +439,14 @@ oss_graph_construction/
 │   │       ├── actor-actor/
 │   │       ├── actor-repo/
 │   │       └── actor-discussion/
-│   └── burnout-analysis/            # 分析结果
-│       ├── summary.json             # 评分排名
-│       ├── all_alerts.json          # 预警列表
-│       ├── full_analysis.json       # 完整分析数据
-│       └── detailed_report.txt      # 可读报告
+│   ├── burnout-analysis/            # 倦怠分析结果
+│   │   ├── summary.json             # 评分排名
+│   │   ├── all_alerts.json          # 预警列表
+│   │   ├── full_analysis.json       # 完整分析数据
+│   │   └── detailed_report.txt      # 可读报告
+│   └── personnel-flow/              # 人员流动分析结果
+│       ├── personnel_flow.json      # 流动数据
+│       └── summary_report.txt       # 摘要报告
 ├── scripts/
 │   ├── collect_data.sh              # 数据采集脚本
 │   └── analyze_burnout.sh           # 分析运行脚本
@@ -387,11 +461,13 @@ oss_graph_construction/
 
 ```bash
 python -m src.data_collection.gharchive_collector \
-  --start-date 2023-01-01 \
-  --end-date 2025-12-31 \
-  --sample-mode monthly \      # daily/weekly/monthly
-  --output-dir data/filtered \
-  --resume                     # 断点续传
+  --start-date YYYY-MM-DD \
+  --end-date YYYY-MM-DD \
+  --sample-mode fulldaily \    # fulldaily=每天24h合并; daily=每天1h; monthly=每月1h
+  --output-dir data/filtered
+
+# 从已有月度图索引指定仓库列表
+# --repos-from-index output/monthly-graphs/index.json
 ```
 
 ### 月度图构建
@@ -401,6 +477,9 @@ python -m src.analysis.monthly_graph_builder \
   --data-dir data/filtered \
   --output-dir output/monthly-graphs \
   --workers 4                  # 并行进程数
+
+# 仅构建指定月份范围（增量构建，自动合并到已有索引）
+# --start-month YYYY-MM --end-month YYYY-MM
 ```
 
 ### 倦怠分析
@@ -409,6 +488,20 @@ python -m src.analysis.monthly_graph_builder \
 python -m src.analysis.burnout_analyzer \
   --graphs-dir output/monthly-graphs \
   --output-dir output/burnout-analysis
+```
+
+### 人员流动分析
+
+```bash
+# 核心成员（默认）
+python -m src.analysis.personnel_flow \
+  --input output/burnout-analysis/full_analysis.json \
+  --output-dir output/personnel-flow
+
+# 全部贡献者（需指定 --graphs-dir）
+python -m src.analysis.personnel_flow --scope all \
+  --graphs-dir output/monthly-graphs2 \
+  --input output/burnout-analysis/full_analysis.json
 ```
 
 ### 详细报告
