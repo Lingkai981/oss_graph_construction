@@ -536,6 +536,7 @@ class PersonnelFlowAnalyzer:
         self._save_flow_timeline_report(results)
         self._save_repo_trend_report()
         self._save_cross_repo_flow_report(results)
+        self._save_yearly_status_report(results)
         return results
 
     def _save_leave_events_detail(self, results: Dict[str, Any]) -> None:
@@ -637,6 +638,106 @@ class PersonnelFlowAnalyzer:
             net_str = f"+{net}" if net > 0 else str(net)
             lines.append(f"  {repo}")
             lines.append(f"    流入: {i} 人  流出: {o} 人  净: {net_str} 人")
+        lines.append("")
+
+        # ======================================================================
+        # AI 辅助洞察：流动模式分析
+        # ======================================================================
+        lines.append("=" * 70)
+        lines.append("AI 辅助洞察：流动模式自动分析")
+        lines.append("=" * 70)
+        lines.append("说明：")
+        lines.append("- 生态共荣：双向流动频繁，说明技术栈紧密耦合（双向均 ≥ 5 人，且比例 < 3:1）")
+        lines.append("- 强单向转移：主要的贡献者流向（A→B人数是B→A的3倍以上，且A→B > 10）")
+        lines.append("- 新兴磁铁：人才净流入显著的大型项目（净流入 > 30）")
+        lines.append("- 基础设施/人才库：人才净流出显著，通常是底层库或跳板项目（净流出 < -30）")
+        lines.append("")
+
+        # 1. 分析双向/单向关系
+        repo_pairs = set()
+        for (f, t) in flow_counts.keys():
+            if f < t:
+                repo_pairs.add((f, t))
+            else:
+                repo_pairs.add((t, f))
+        
+        symbiotic = []
+        one_way = []
+
+        for r1, r2 in repo_pairs:
+            f1_to_2 = flow_counts.get((r1, r2), 0)
+            f2_to_1 = flow_counts.get((r2, r1), 0)
+            total = f1_to_2 + f2_to_1
+            if total == 0:
+                continue
+
+            # 双向强关联判定: 双方都有一定流动，且不极端失衡
+            if f1_to_2 >= 5 and f2_to_1 >= 5:
+                ratio = max(f1_to_2, f2_to_1) / min(f1_to_2, f2_to_1)
+                if ratio < 3.0:
+                    symbiotic.append((r1, r2, f1_to_2, f2_to_1, total))
+                    continue
+            
+            # 单向判定
+            if f1_to_2 > 10 and f1_to_2 > f2_to_1 * 3:
+                one_way.append((r1, r2, f1_to_2, f2_to_1))
+            elif f2_to_1 > 10 and f2_to_1 > f1_to_2 * 3:
+                one_way.append((r2, r1, f2_to_1, f1_to_2))
+
+        symbiotic.sort(key=lambda x: -x[4]) # 按总交流人数降序
+        lines.append("[ 生态共荣组合 ] (强关联/上下游耦合)")
+        for r1, r2, v1, v2, tot in symbiotic[:20]:
+            # 为了展示一致性，让名字短的在前，或者不需要特定顺序
+            lines.append(f"  {r1} ↔ {r2}")
+            lines.append(f"    共 {tot} 人交互 ({r1}→{r2}: {v1} 人, 反向: {v2} 人)")
+        if not symbiotic:
+            lines.append("  (无显著结果)")
+        lines.append("")
+
+        one_way.sort(key=lambda x: -x[2]) # 按流量降序
+        lines.append("[ 强单向转移 ] (流行度转移或特定依赖路径)")
+        for src, dst, v_forward, v_back in one_way[:20]:
+            lines.append(f"  {src} → {dst}")
+            lines.append(f"    单向流动: {v_forward} 人 (反向仅 {v_back} 人)")
+        if not one_way:
+            lines.append("  (无显著结果)")
+        lines.append("")
+
+        # 2. 分析净流入流出（改为比率分析，并避免重叠）
+        # 这里的重叠主要指：一个项目既是磁铁又是基础设施（不可能，因为净流正负互斥），
+        # 或者出现在上面的关系对中。关系对和单点属性不冲突。
+        # 使用比率分析：(流入-流出)/(流入+流出)，更能体现“趋势”而非单纯的体量。
+        
+        repo_stats = []
+        for r, i, o, net in repo_net:
+            total = i + o
+            if total < 50: # 忽略小样本，避免波动太大
+                continue
+            ratio = net / total if total > 0 else 0
+            repo_stats.append((r, i, o, net, ratio))
+
+        # 磁铁：比率 > 15% (即净流入显著)
+        magnets = [x for x in repo_stats if x[4] > 0.15]
+        magnets.sort(key=lambda x: -x[4]) # 按比率降序
+
+        # 基础设施/流失：比率 < -15% (即净流出显著)
+        feeders = [x for x in repo_stats if x[4] < -0.15]
+        feeders.sort(key=lambda x: x[4]) # 按比率升序（负得越多越前）
+
+        lines.append("[ 新兴磁铁 ] (高净流入比 - 正在快速吸纳人才)")
+        lines.append(f"说明：总流动 > 50 人，且 (流入-流出)/总流动 > 15%")
+        for r, i, o, net, ratio in magnets[:15]:
+             lines.append(f"  {r:<30} : 净增 {ratio:+.1%} (净+{net} | 入 {i} / 出 {o})")
+        if not magnets:
+            lines.append("  (无显著结果)")
+        lines.append("")
+
+        lines.append("[ 基础设施/人才库 ] (高净流出比 - 广泛被使用或作为跳板)")
+        lines.append(f"说明：总流动 > 50 人，且 (流入-流出)/总流动 < -15%")
+        for r, i, o, net, ratio in feeders[:15]:
+             lines.append(f"  {r:<30} : 净流 {ratio:+.1%} (净{net} | 入 {i} / 出 {o})")
+        if not feeders:
+            lines.append("  (无显著结果)")
         lines.append("")
 
         with open(report_path, "w", encoding="utf-8") as f:
@@ -1011,6 +1112,109 @@ class PersonnelFlowAnalyzer:
             f.write("\n".join(lines))
         logger.info(f"摘要报告已保存: {report_path}")
 
+    def _save_yearly_status_report(self, results: Dict[str, Any]) -> None:
+        """按年分析项目状态（磁铁/基础设施等）"""
+        report_path = self.output_dir / "repo_yearly_status.txt"
+        
+        # 1. 构建每年的流动数据
+        # year_stats[year][repo] = {"in": 0, "out": 0}
+        year_stats: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {"in": 0, "out": 0}))
+
+        for repo_name, repo_result in results.items():
+            if "error" in repo_result:
+                continue
+            
+            # 统计流出
+            for evt in repo_result.get("leave_events", []):
+                month = evt.get("month", "")
+                year = month[:4] if len(month) >= 4 else "Unknown"
+                if year == "Unknown": continue
+
+                for dest in evt.get("flowed_to", []):
+                    to_repo = dest["repo"]
+                    # 只有当目标在我们的分析范围内时才计入（确保闭环）
+                    if to_repo in results:
+                        year_stats[year][repo_name]["out"] += 1
+                        year_stats[year][to_repo]["in"] += 1
+
+        years = sorted(year_stats.keys())
+        lines = []
+        lines.append("=" * 80)
+        lines.append("项目年度流动状态分析")
+        lines.append("=" * 80)
+        lines.append("说明：")
+        lines.append("- 磁铁型 (Magnet): 净流入比 > 15% (且总流动 > 5)")
+        lines.append("- 输血型 (Feeder): 净流出比 < -15% (且总流动 > 5)")
+        lines.append("- 平衡型 (Balanced): 介于两者之间")
+        lines.append("- 沉寂型 (Quiet): 总流动 ≤ 5")
+        lines.append("")
+
+        for year in years:
+            lines.append(f"\n[ {year} 年度状态 ]")
+            lines.append("-" * 80)
+            
+            # 分类存储
+            magnets = []
+            feeders = []
+            balanced = []
+            quiet = []
+
+            stats_map = year_stats[year]
+            # 确保我们要分析的所有 repo 都在 stats_map 里（即使没有流动记为0）
+            current_repos = sorted(results.keys())
+            
+            for repo in current_repos:
+                s = stats_map.get(repo, {"in": 0, "out": 0})
+                i, o = s["in"], s["out"]
+                net = i - o
+                total = i + o
+                ratio = net / total if total > 0 else 0
+
+                item = (repo, i, o, net, ratio, total) # 增加 total
+
+                if total <= 5:
+                    quiet.append(item)
+                elif ratio > 0.15:
+                    magnets.append(item)
+                elif ratio < -0.15:
+                    feeders.append(item)
+                else:
+                    balanced.append(item)
+
+            # 排序逻辑：磁铁按净流入降序，输血按净流出升序（负最多）
+            magnets.sort(key=lambda x: -x[4])
+            feeders.sort(key=lambda x: x[4])
+            balanced.sort(key=lambda x: -x[5]) # 平衡型按总活跃度
+            quiet.sort(key=lambda x: -x[5]) # 沉寂型按总活跃度
+
+            if magnets:
+                lines.append("  🚀 磁铁型 (吸纳人才):")
+                for r, i, o, n, rat, t in magnets: # 显示全部
+                    lines.append(f"    {r:<30} : 净增 {rat:+.1%} (净{n:+d} | 入{i}/出{o})")
+            
+            if feeders:
+                lines.append("\n  🌱 输血型 (人才输出):")
+                for r, i, o, n, rat, t in feeders: # 显示全部
+                    lines.append(f"    {r:<30} : 净流 {rat:+.1%} (净{n:+d} | 入{i}/出{o})")
+
+            if balanced:
+                lines.append("\n  ⚖️ 平衡型 (流动稳定):")
+                for r, i, o, n, rat, t in balanced: # 显示全部
+                    lines.append(f"    {r:<30} : 净 {rat:+.1%} (入{i}/出{o})")
+
+            if quiet:
+                lines.append("\n  💤 沉寂型 (流动极少 ≤ 5):")
+                # 沉寂型可以折叠显示，或者只列名字，避免太长
+                # 按每行3个显示
+                quiet_repos = [r for r, _, _, _, _, _ in quiet]
+                for k in range(0, len(quiet_repos), 3):
+                    chunk = quiet_repos[k:k+3]
+                    lines.append("    " + "  ,  ".join(chunk))
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        logger.info(f"年度状态分析已保存: {report_path}")
+
 
 def main():
     import argparse
@@ -1044,7 +1248,7 @@ def main():
         "--flow-months",
         type=int,
         default=12,
-        help="离开后追踪流向的月数 (默认: 12)",
+        help="离开后追踪流向的月数 (默认: 12)"
     )
     args = parser.parse_args()
 
