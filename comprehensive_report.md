@@ -24,7 +24,7 @@
 总分由四大维度构成 (**各占 25%**)，且所有分数均经过 Min-Max 归一化处理。
 **⚠️ 统一标准**: 所有维度的评分 (Normalized Score) 均为 **越高越好 (Higher is Better)**。
 
-### 1. 🧠 维护健康度 (Project Maintenance)
+### 1. 🧠 维护者倦怠 ()
 > **数据来源**: Burnout Analysis Model (Pre-calculated)
 *   **核心指标**: 事件总量 (Events)、贡献者规模 (Contributors)、核心开发者数 (Core Actors)、网络聚类系数 (Clustering)。
 *   **评估逻辑**: 综合评估项目的活跃规模与核心维护团队的抗风险能力 (Burnout Resilience)。
