@@ -29,6 +29,7 @@ Thumbs.db
 logs/*.log
 data/filtered/
 data/filtered_union_2021_2025_daily/
+data/filtered_union_2024_fulldaily/
 
 # Output files
 output/
