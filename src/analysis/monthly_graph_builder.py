@@ -439,6 +439,7 @@ def build_actor_repo_graph(
     构建 Actor-Repository 二部图
     
     边类型：基于事件类型（PUSH, CREATE, ISSUE, PR, COMMENT 等）
+    新增：边包含详细统计信息（commit_count, pr_merged 等）
     """
     graph = nx.MultiDiGraph()
     actors: Dict[int, ActorStats] = {}
@@ -493,11 +494,42 @@ def build_actor_repo_graph(
         }
         edge_type = edge_type_map.get(event_type, event_type)
 
-        # 只有“评论类事件”才有正文
+        # 只有"评论类事件"才有正文
         comment_body = ""
         if event_type in ("IssueCommentEvent", "PullRequestReviewCommentEvent"):
             comment = (event.get("payload") or {}).get("comment") or {}
             comment_body = _sanitize_comment_text(comment.get("body", "") or "")
+        
+        # 从 payload 中提取详细统计信息
+        payload = event.get("payload") or {}
+        commit_count = 0
+        pr_merged = 0
+        pr_opened = 0
+        pr_closed = 0
+        issue_opened = 0
+        issue_closed = 0
+        is_comment = 0
+        
+        if event_type == "PushEvent":
+            commits = payload.get("commits") or []
+            commit_count = len(commits)
+        elif event_type == "PullRequestEvent":
+            action = payload.get("action")
+            pr = payload.get("pull_request") or {}
+            if action == "opened":
+                pr_opened = 1
+            elif action == "closed":
+                pr_closed = 1
+                if pr.get("merged"):
+                    pr_merged = 1
+        elif event_type == "IssuesEvent":
+            action = payload.get("action")
+            if action == "opened":
+                issue_opened = 1
+            elif action == "closed":
+                issue_closed = 1
+        elif event_type in ("IssueCommentEvent", "PullRequestReviewCommentEvent"):
+            is_comment = 1
 
         edges.append({
             "actor_id": actor_id,
@@ -506,6 +538,14 @@ def build_actor_repo_graph(
             "event_id": event_id,
             "created_at": created_at,
             "comment_body": comment_body,
+            # 新增：详细统计信息
+            "commit_count": commit_count,
+            "pr_merged": pr_merged,
+            "pr_opened": pr_opened,
+            "pr_closed": pr_closed,
+            "issue_opened": issue_opened,
+            "issue_closed": issue_closed,
+            "is_comment": is_comment,
         })
     
     # 添加节点
@@ -515,15 +555,27 @@ def build_actor_repo_graph(
     for repo_id, repo_stats in repos.items():
         graph.add_node(f"repo:{repo_id}", **repo_stats.to_dict())
     
-    # 添加边
+    # 添加边（每条事件仍然是独立的边，但包含统计信息）
     for edge_data in edges:
         source = f"actor:{edge_data['actor_id']}"
         target = f"repo:{edge_data['repo_id']}"
         edge_key = f"{edge_data['edge_type']}_{edge_data['event_id']}"
-        graph.add_edge(source, target, key=edge_key,
-                       edge_type=edge_data["edge_type"],
-                       created_at=edge_data.get("created_at") or "",
-                       comment_body=edge_data.get("comment_body", ""))
+        graph.add_edge(
+            source, 
+            target, 
+            key=edge_key,
+            edge_type=edge_data["edge_type"],
+            created_at=edge_data.get("created_at") or "",
+            comment_body=edge_data.get("comment_body", ""),
+            # 新增：统计信息
+            commit_count=edge_data.get("commit_count", 0),
+            pr_merged=edge_data.get("pr_merged", 0),
+            pr_opened=edge_data.get("pr_opened", 0),
+            pr_closed=edge_data.get("pr_closed", 0),
+            issue_opened=edge_data.get("issue_opened", 0),
+            issue_closed=edge_data.get("issue_closed", 0),
+            is_comment=edge_data.get("is_comment", 0),
+        )
     
     graph.graph["repo_name"] = repo_name
     graph.graph["month"] = month
