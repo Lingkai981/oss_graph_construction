@@ -468,6 +468,7 @@ python -m src.data_collection.gharchive_collector \
 
 # 从已有月度图索引指定仓库列表
 # --repos-from-index output/monthly-graphs/index.json
+# python -m src.data_collection.gharchive_collector --start-date 2024-01-01 --end-date 2024-12-31 --sample-mode fulldaily --workers 32 --output-dir data/filtered_union_2024_fulldaily --repos-from-index output/monthly-graphs2/index.json
 ```
 
 ### 月度图构建
