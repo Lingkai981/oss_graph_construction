@@ -27,10 +27,10 @@ python run_analysis.py --all
 
 - 按预设顺序依次执行 **全部分析器** 和 **全部报告生成器**：
   - 构图：monthly_graphs
-  - 分析：burnout, newcomer, community_atmosphere, bus_factor, quality_risk, structure, personnel_flow
+  - 分析：burnout, newcomer, toxicity_cache（调用 ToxiCR 生成毒性缓存）, bus_factor, quality_risk, structure, personnel_flow, community_atmosphere
   - 报告：burnout_report, newcomer_report, bus_factor_report, atmosphere_report, quality_risk_report, structure_report, comprehensive_report
 - 使用默认的数据路径和输出路径：
-  - 数据目录：自动从 `data/filtered`、`data/filtered_union_2024_fulldaily`、`data/filtered_union_2021_2025_daily` 中“就近选取”，找不到则用 `data`。
+  - 数据目录：自动从 `data/filtered_union_2021_2025_daily`、`data/filtered`、`data/filtered_union_2024_fulldaily` 中“就近选取”，找不到则用 `data`。
   - 图目录：`output/monthly-graphs`
   - 各分析结果目录：挂在 `output/` 下面的子目录（见后文）。
   - 综合报告：默认写入 `output/comprehensive_report.md`。
@@ -58,7 +58,7 @@ python run_analysis.py --list
 2. **根据参数选择要执行的任务**：
    - 若使用 `--all`：
      - 分析器顺序：
-       - `monthly_graphs` → `burnout` → `newcomer` → `community_atmosphere` → `bus_factor` → `quality_risk` → `structure` → `personnel_flow`
+       - `monthly_graphs` → `burnout` → `newcomer` → `toxicity_cache` → `bus_factor` → `quality_risk` → `structure` → `personnel_flow` → `community_atmosphere`
      - 报告顺序：
        - `burnout_report` → `newcomer_report` → `bus_factor_report` → `atmosphere_report` → `quality_risk_report` → `structure_report` → `comprehensive_report`
    - 若使用 `--analyzers` / `--reports`：
@@ -82,6 +82,7 @@ python run_analysis.py --list
   - **不会自动**为你加上构图步骤，也不会自动补齐上游分析任务；
   - 例如：
     - `python run_analysis.py --analyzers burnout` 不会自动执行 `monthly_graphs`，要求你已经有构图结果；
+    - `python run_analysis.py --analyzers community_atmosphere` 不会自动执行构图或毒性缓存，需先有 `monthly_graphs` 和 `toxicity_cache` 结果；
     - `python run_analysis.py --reports burnout_report` 要求对应的 `burnout` 分析结果已存在，否则会因为缺少依赖文件而报错。
 
 > 因此：
@@ -100,16 +101,18 @@ python run_analysis.py --list
 1. `monthly_graphs` — 按月构建图数据快照（协作网络、仓库关系等）。
 2. `burnout` — 执行维护者倦怠分析，输出全量与摘要 JSON。
 3. `newcomer` — 执行新人融入与晋升路径分析，输出 full/summary JSON。
-4. `community_atmosphere` — 执行社区氛围分析，可选仅对 top30 仓库分析。
+4. `toxicity_cache` — 调用同级目录的 ToxiCR 项目生成毒性缓存 `output/community-atmosphere-analysis/toxicity.json`，供社区氛围分析使用。
 5. `bus_factor` — 执行 Bus Factor 风险分析，识别高度依赖少数核心开发者的模块/仓库。
 6. `quality_risk` — 质量与权限滥用风险分析，识别潜在可疑行为或异常贡献模式。
 7. `structure` — 协作网络结构分析，计算图直径、平均距离等结构指标。
 8. `personnel_flow` — 人员流动分析，基于倦怠核心成员时间线统计离开后流向。
+9. `community_atmosphere` — 执行社区氛围分析，可选仅对 top30 仓库分析，依赖构图与毒性缓存。
 
 > 依赖关系（部分）：
 >
 > - 通常所有分析都依赖 **构图结果**（`monthly_graphs`）。
 > - `personnel_flow` 明确依赖 `burnout` 产出的 `full_analysis.json`。
+> - `community_atmosphere` 依赖 `monthly_graphs` 的图数据，以及 `toxicity_cache` 生成的 `output/community-atmosphere-analysis/toxicity.json`（若缺失会报错提示先执行毒性缓存）。
 
 ### 4.2 报告生成任务（REPORTS）
 
@@ -431,6 +434,23 @@ python run_analysis.py \
   --analyzers community_atmosphere \
   --reports atmosphere_report \
   --atmosphere-top30
+
+### 场景 8：仅生成/刷新毒性缓存（供社区氛围分析使用）
+
+**目标**：在不同环境下运行 ToxiCR，生成社区氛围依赖的 `toxicity.json`，并将其写入本项目的 `output/community-atmosphere-analysis/`。
+
+```bash
+python run_analysis.py \
+  --analyzers monthly_graphs toxicity_cache \
+  --graphs-dir output/monthly-graphs \
+  --output-dir output \
+  --atmosphere-top30   # 若希望只针对 top30 仓库生成毒性缓存，可添加此开关
+```
+
+说明：
+
+- `toxicity_cache` 会通过 `subprocess` 调用同级目录下的 `ToxiCR/analyze_oss_comments.py`，优先使用 ToxiCR 项目的虚拟环境（若存在），并实时输出日志到终端。
+- 输出文件固定写到 `output/community-atmosphere-analysis/toxicity.json`，以匹配社区氛围分析器的硬编码读取路径。
 ```
 
 ---
@@ -439,7 +459,8 @@ python run_analysis.py \
 
 - **任务选择**：
   - `--all` 会自动保证正确的先后顺序（从构图到综合报告）。
-  - 单独使用 `--analyzers`、`--reports` 时，你需要自行确认上游依赖是否已经存在。
+  - 单独使用 `--analyzers`、`--reports` 时，你需要自行确认上游依赖是否已经存在；且分析器的实际执行顺序会按照代码内的固定顺序（忽略命令行排列）。
+  - 社区氛围分析需确保：构图结果已存在、毒性缓存已生成（可通过 `toxicity_cache` 任务提前生成）。
 
 - **路径一致性**：
   - 建议始终在项目根目录下运行命令，避免路径混乱；
