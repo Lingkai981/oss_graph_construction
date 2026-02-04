@@ -484,6 +484,13 @@ def main():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别 (默认: INFO)"
     )
+
+    parser.add_argument(
+        "--repo-list",
+        type=str,
+        default=None,
+        help="repo 名单 JSON 文件路径（内容为 ['owner/repo', ...]）"
+    )
     
     args = parser.parse_args()
     
