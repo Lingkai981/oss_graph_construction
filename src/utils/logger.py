@@ -49,10 +49,13 @@ def setup_logger(log_level: str = "INFO", log_file: str = "logs/app.log") -> log
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     
-    # 控制台处理器
-    console_handler = logging.StreamHandler()
+    # 控制台处理器（立即刷新）
+    import sys
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(getattr(logging, log_level.upper()))
     console_handler.setFormatter(formatter)
+    # 设置立即刷新
+    console_handler.stream.reconfigure(line_buffering=True) if hasattr(console_handler.stream, 'reconfigure') else None
     logger.addHandler(console_handler)
     
     return logger

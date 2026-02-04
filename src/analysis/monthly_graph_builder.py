@@ -35,6 +35,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import re
+
 import networkx as nx
 
 from src.utils.logger import get_logger
@@ -168,20 +170,86 @@ def group_by_month_and_repo(
 
 # ==================== 图构建函数 ====================
 
-def _escape_xml_text(text: str) -> str:
-    """转义 XML 特殊字符"""
+def _clean_text_for_xml(text: str) -> str:
+    """
+    清理文本中的控制字符，使其可以作为 XML 文本安全写入
+    
+    移除 XML 1.0 不允许的控制字符（除了 \t \n \r），保留其他所有字符。
+    NetworkX/ElementTree 会自动处理 XML 转义（& < > " '），所以这里只清理控制字符。
+    
+    适用于所有文本字段：login, name, title, creator_login 等
+    """
     if not text:
         return ""
-    return (text
+    
+    # 过滤 XML 不允许的控制字符（与 _sanitize_comment_text 使用相同的逻辑）
+    return "".join(
+        ch
+        for ch in text
+        if (
+            ch == "\t"
+            or ch == "\n"
+            or ch == "\r"
+            or 0x20 <= ord(ch) <= 0xD7FF
+            or 0xE000 <= ord(ch) <= 0xFFFD
+        )
+    )
+
+
+def _escape_xml_text(text: str) -> str:
+    """
+    转义 XML 特殊字符并清理控制字符
+    
+    先清理 XML 不允许的控制字符（除了 \t \n \r），再进行 XML 转义，
+    确保生成的 XML 文件格式正确。与 _sanitize_comment_text 使用相同的控制字符过滤逻辑。
+    
+    注意：此函数会转义 XML 特殊字符，适用于需要手动转义的场景。
+    对于 NetworkX 写入的字段，使用 _clean_text_for_xml 即可（NetworkX 会自动转义）。
+    """
+    if not text:
+        return ""
+    
+    # 先清理控制字符
+    cleaned = _clean_text_for_xml(text)
+    
+    # 然后转义 XML 特殊字符
+    return (cleaned
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;")
             .replace("'", "&apos;")
-            .replace("\x00", "")  # 移除空字符
-            .replace("\x0b", "")  # 移除垂直制表符
-            .replace("\x0c", "")  # 移除换页符
             )
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def _sanitize_comment_text(text: str) -> str:
+    """
+    清洗评论正文/日志文本，使其可以作为 GraphML 文本安全写入：
+    - 去掉 ANSI 颜色控制序列（例如 [32m）
+    - 去掉 XML 1.0 不允许的控制字符（除了 \t \n \r）
+    其余内容原样保留，让 NetworkX/ElementTree 负责正常的 XML 转义。
+    """
+    if not text:
+        return ""
+
+    # 1) 去掉 ANSI 颜色控制序列
+    cleaned = _ANSI_ESCAPE_RE.sub("", text)
+
+    # 2) 过滤 XML 不允许的控制字符
+    return "".join(
+        ch
+        for ch in cleaned
+        if (
+            ch == "\t"
+            or ch == "\n"
+            or ch == "\r"
+            or 0x20 <= ord(ch) <= 0xD7FF
+            or 0xE000 <= ord(ch) <= 0xFFFD
+        )
+    )
 
 
 def build_actor_actor_graph(
@@ -213,7 +281,7 @@ def build_actor_actor_graph(
         if actor_id not in actors:
             actors[actor_id] = ActorStats(
                 actor_id=actor_id,
-                login=actor_data.get("login") or "",
+                login=_clean_text_for_xml(actor_data.get("login") or ""),
             )
         return actor_id
     
@@ -271,7 +339,7 @@ def build_actor_actor_graph(
                 
                 if creator_id and creator_id != actor_id:
                     comment = payload.get("comment") or {}
-                    comment_body = comment.get("body", "")
+                    comment_body = _sanitize_comment_text(comment.get("body", ""))
                     edges.append({
                         "source": actor_id, "target": creator_id,
                         "edge_type": "ISSUE_INTERACTION",
@@ -293,7 +361,7 @@ def build_actor_actor_graph(
                 
                 if creator_id and creator_id != actor_id:
                     comment = payload.get("comment") or {}
-                    comment_body = comment.get("body", "")
+                    comment_body = _sanitize_comment_text(comment.get("body", ""))
                     edges.append({
                         "source": actor_id, "target": creator_id,
                         "edge_type": "PR_REVIEW",
@@ -371,6 +439,7 @@ def build_actor_repo_graph(
     构建 Actor-Repository 二部图
     
     边类型：基于事件类型（PUSH, CREATE, ISSUE, PR, COMMENT 等）
+    新增：边包含详细统计信息（commit_count, pr_merged 等）
     """
     graph = nx.MultiDiGraph()
     actors: Dict[int, ActorStats] = {}
@@ -394,7 +463,7 @@ def build_actor_repo_graph(
         if actor_id not in actors:
             actors[actor_id] = ActorStats(
                 actor_id=actor_id,
-                login=actor.get("login") or "",
+                login=_clean_text_for_xml(actor.get("login") or ""),
             )
         actors[actor_id].event_count += 1
         actors[actor_id].event_types[event_type] = \
@@ -404,7 +473,7 @@ def build_actor_repo_graph(
         if repo_id not in repos:
             repos[repo_id] = RepoStats(
                 repo_id=repo_id,
-                name=repo.get("name") or "",
+                name=_clean_text_for_xml(repo.get("name") or ""),
             )
         repos[repo_id].event_count += 1
         repos[repo_id].event_types[event_type] = \
@@ -425,11 +494,42 @@ def build_actor_repo_graph(
         }
         edge_type = edge_type_map.get(event_type, event_type)
 
-        # 只有“评论类事件”才有正文
+        # 只有"评论类事件"才有正文
         comment_body = ""
         if event_type in ("IssueCommentEvent", "PullRequestReviewCommentEvent"):
             comment = (event.get("payload") or {}).get("comment") or {}
-            comment_body = comment.get("body", "") or ""
+            comment_body = _sanitize_comment_text(comment.get("body", "") or "")
+        
+        # 从 payload 中提取详细统计信息
+        payload = event.get("payload") or {}
+        commit_count = 0
+        pr_merged = 0
+        pr_opened = 0
+        pr_closed = 0
+        issue_opened = 0
+        issue_closed = 0
+        is_comment = 0
+        
+        if event_type == "PushEvent":
+            commits = payload.get("commits") or []
+            commit_count = len(commits)
+        elif event_type == "PullRequestEvent":
+            action = payload.get("action")
+            pr = payload.get("pull_request") or {}
+            if action == "opened":
+                pr_opened = 1
+            elif action == "closed":
+                pr_closed = 1
+                if pr.get("merged"):
+                    pr_merged = 1
+        elif event_type == "IssuesEvent":
+            action = payload.get("action")
+            if action == "opened":
+                issue_opened = 1
+            elif action == "closed":
+                issue_closed = 1
+        elif event_type in ("IssueCommentEvent", "PullRequestReviewCommentEvent"):
+            is_comment = 1
 
         edges.append({
             "actor_id": actor_id,
@@ -438,6 +538,14 @@ def build_actor_repo_graph(
             "event_id": event_id,
             "created_at": created_at,
             "comment_body": comment_body,
+            # 新增：详细统计信息
+            "commit_count": commit_count,
+            "pr_merged": pr_merged,
+            "pr_opened": pr_opened,
+            "pr_closed": pr_closed,
+            "issue_opened": issue_opened,
+            "issue_closed": issue_closed,
+            "is_comment": is_comment,
         })
     
     # 添加节点
@@ -447,15 +555,27 @@ def build_actor_repo_graph(
     for repo_id, repo_stats in repos.items():
         graph.add_node(f"repo:{repo_id}", **repo_stats.to_dict())
     
-    # 添加边
+    # 添加边（每条事件仍然是独立的边，但包含统计信息）
     for edge_data in edges:
         source = f"actor:{edge_data['actor_id']}"
         target = f"repo:{edge_data['repo_id']}"
         edge_key = f"{edge_data['edge_type']}_{edge_data['event_id']}"
-        graph.add_edge(source, target, key=edge_key,
-                       edge_type=edge_data["edge_type"],
-                       created_at=edge_data.get("created_at") or "",
-                       comment_body=edge_data.get("comment_body", ""))
+        graph.add_edge(
+            source, 
+            target, 
+            key=edge_key,
+            edge_type=edge_data["edge_type"],
+            created_at=edge_data.get("created_at") or "",
+            comment_body=edge_data.get("comment_body", ""),
+            # 新增：统计信息
+            commit_count=edge_data.get("commit_count", 0),
+            pr_merged=edge_data.get("pr_merged", 0),
+            pr_opened=edge_data.get("pr_opened", 0),
+            pr_closed=edge_data.get("pr_closed", 0),
+            issue_opened=edge_data.get("issue_opened", 0),
+            issue_closed=edge_data.get("issue_closed", 0),
+            is_comment=edge_data.get("is_comment", 0),
+        )
     
     graph.graph["repo_name"] = repo_name
     graph.graph["month"] = month
@@ -488,7 +608,7 @@ def build_actor_discussion_graph(
         if actor_id not in actors:
             actors[actor_id] = ActorStats(
                 actor_id=actor_id,
-                login=actor_data.get("login") or "",
+                login=_clean_text_for_xml(actor_data.get("login") or ""),
             )
         return actor_id
     
@@ -528,10 +648,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="Issue",
                         number=issue_number,
-                        title=_escape_xml_text(issue.get("title") or ""),
+                        title=_clean_text_for_xml(issue.get("title") or ""),
                         state=issue.get("state") or "",
                         creator_id=issue_user.get("id"),
-                        creator_login=issue_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(issue_user.get("login") or ""),
                         created_at=issue.get("created_at"),
                     )
                 
@@ -559,10 +679,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="Issue",
                         number=issue_number,
-                        title=_escape_xml_text(issue.get("title") or ""),
+                        title=_clean_text_for_xml(issue.get("title") or ""),
                         state=issue.get("state") or "",
                         creator_id=issue_user.get("id"),
-                        creator_login=issue_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(issue_user.get("login") or ""),
                         created_at=issue.get("created_at"),
                     )
                 
@@ -576,7 +696,7 @@ def build_actor_discussion_graph(
                 
                 # 获取评论正文（直接从事件数据中提取）
                 comment = payload.get("comment") or {}
-                comment_body = comment.get("body", "")
+                comment_body = _sanitize_comment_text(comment.get("body", ""))
 
                 edges.append({
                     "actor_id": actor_id,
@@ -601,10 +721,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="PullRequest",
                         number=pr_number,
-                        title=_escape_xml_text(pr.get("title") or ""),
+                        title=_clean_text_for_xml(pr.get("title") or ""),
                         state=pr.get("state") or "",
                         creator_id=pr_user.get("id"),
-                        creator_login=pr_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(pr_user.get("login") or ""),
                         created_at=pr.get("created_at"),
                     )
                 
@@ -640,10 +760,10 @@ def build_actor_discussion_graph(
                         key=key,
                         node_type="PullRequest",
                         number=pr_number,
-                        title=_escape_xml_text(pr.get("title") or ""),
+                        title=_clean_text_for_xml(pr.get("title") or ""),
                         state=pr.get("state") or "",
                         creator_id=pr_user.get("id"),
-                        creator_login=pr_user.get("login") or "",
+                        creator_login=_clean_text_for_xml(pr_user.get("login") or ""),
                         created_at=pr.get("created_at"),
                     )
                 
@@ -657,7 +777,7 @@ def build_actor_discussion_graph(
                 
                 # 获取评论正文（直接从事件数据中提取）
                 comment = payload.get("comment") or {}
-                comment_body = comment.get("body", "")
+                comment_body = _sanitize_comment_text(comment.get("body", ""))
                 edges.append({
                     "actor_id": actor_id,
                     "discussion_key": key,
