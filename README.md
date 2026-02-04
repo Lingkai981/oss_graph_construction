@@ -49,9 +49,9 @@ python -m src.data_collection.gharchive_collector \
 ```
 
 python3 -m src.data_collection.gharchive_collector \
-  --start-date 2021-02-25 --end-date 2025-12-31 \
+  --start-date 2021-07-01 --end-date 2025-12-31 \
   --sample-mode fulldaily \
-  --workers 32 \
+  --workers 16 \
   --repos-from-index output/monthly-graphs2/index.json \
   --output-dir /Users/milk/test_data/ali2025/filtered_union_2021_2025_fulldaily
 
