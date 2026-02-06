@@ -185,6 +185,85 @@ def load_filtered_data(data_dir: str) -> Dict[str, List[Dict]]:
     return dict(all_data)
 
 
+def get_available_months(data_dir: str) -> List[str]:
+    """扫描数据目录，获取所有可用的月份列表"""
+    data_path = Path(data_dir)
+    months = set()
+    
+    for file_path in data_path.glob("*-filtered.json"):
+        filename = file_path.stem
+        parts = filename.replace("-filtered", "").split("-")
+        if len(parts) >= 3:
+            month = f"{parts[0]}-{parts[1]}"
+            months.add(month)
+    
+    return sorted(months)
+
+
+def get_processed_months(output_dir: str) -> Set[str]:
+    """扫描输出目录，获取已处理的月份列表
+    
+    通过检查 index.json 或扫描目录结构来确定
+    """
+    output_path = Path(output_dir)
+    processed = set()
+    
+    # 优先从 index.json 读取
+    index_file = output_path / "index.json"
+    if index_file.exists():
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            # 收集所有已处理的月份
+            for repo_name, graph_types in index.items():
+                for graph_type, months in graph_types.items():
+                    processed.update(months.keys())
+        except Exception:
+            pass
+    
+    return processed
+
+
+def load_month_data(data_dir: str, month: str) -> Dict[str, List[Dict]]:
+    """只加载指定月份的数据
+    
+    Args:
+        data_dir: 数据目录
+        month: 月份字符串，如 "2021-01"
+    
+    Returns:
+        {repo_name: [events]}
+    """
+    data_path = Path(data_dir)
+    repo_events = defaultdict(list)
+    
+    # 匹配该月份的所有日期文件
+    pattern = f"{month}-*-filtered.json"
+    files = sorted(data_path.glob(pattern))
+    
+    if not files:
+        print(f"  月份 {month} 没有找到数据文件")
+        return {}
+    
+    total_events = 0
+    for file_path in files:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        event = json.loads(line)
+                        repo_name = event.get("repo", {}).get("name", "").lower()
+                        if repo_name:
+                            repo_events[repo_name].append(event)
+                            total_events += 1
+                    except json.JSONDecodeError:
+                        continue
+    
+    print(f"  加载 {month}: {len(files)} 个文件, {total_events} 个事件, {len(repo_events)} 个项目")
+    return dict(repo_events)
+
+
 def group_by_month_and_repo(
     daily_data: Dict[str, List[Dict]]
 ) -> Dict[str, Dict[str, List[Dict]]]:
@@ -1206,6 +1285,159 @@ def build_monthly_graphs_parallel(
     return dict(result)
 
 
+def build_monthly_graphs_streaming(
+    data_dir: str = "data/filtered/",
+    output_dir: str = "output/monthly-graphs/",
+    graph_types: List[str] = None,
+    workers: int = 4,
+    start_month: Optional[str] = None,
+    end_month: Optional[str] = None,
+    skip_existing: bool = True,
+) -> Dict[str, Dict[str, Dict[str, str]]]:
+    """
+    流式按月构建图：每次只加载一个月的数据，处理完后释放内存
+    
+    优点：
+    1. 内存占用低：不需要一次性加载所有数据
+    2. 支持断点续传：已处理的月份自动跳过
+    3. 每月处理完立即保存索引，避免中断丢失进度
+    
+    Args:
+        data_dir: 输入数据目录
+        output_dir: 输出目录  
+        graph_types: 要构建的图类型
+        workers: 并行进程数
+        start_month: 起始月份 (YYYY-MM)
+        end_month: 结束月份 (YYYY-MM)
+        skip_existing: 是否跳过已处理的月份
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import gc
+    
+    if graph_types is None:
+        graph_types = ["actor-actor", "actor-repo", "actor-discussion"]
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # 获取所有可用月份
+    print("扫描可用月份...")
+    all_months = get_available_months(data_dir)
+    print(f"数据目录包含 {len(all_months)} 个月份: {all_months[0]} ~ {all_months[-1]}")
+    
+    # 过滤月份范围
+    months_to_process = []
+    for month in all_months:
+        if start_month and month < start_month:
+            continue
+        if end_month and month > end_month:
+            continue
+        months_to_process.append(month)
+    
+    print(f"待处理月份范围: {months_to_process[0] if months_to_process else 'N/A'} ~ {months_to_process[-1] if months_to_process else 'N/A'} ({len(months_to_process)} 个月)")
+    
+    # 检查已处理的月份
+    if skip_existing:
+        processed_months = get_processed_months(output_dir)
+        original_count = len(months_to_process)
+        months_to_process = [m for m in months_to_process if m not in processed_months]
+        skipped_count = original_count - len(months_to_process)
+        if skipped_count > 0:
+            print(f"跳过已处理的 {skipped_count} 个月份")
+    
+    if not months_to_process:
+        print("没有需要处理的月份")
+        return {}
+    
+    print(f"将处理 {len(months_to_process)} 个月份")
+    print("=" * 60)
+    
+    # 加载或初始化索引
+    index_file = output_path / "index.json"
+    if index_file.exists():
+        with open(index_file, "r", encoding="utf-8") as f:
+            global_index = json.load(f)
+    else:
+        global_index = {}
+    
+    total_graph_count = 0
+    
+    for month_idx, month in enumerate(months_to_process, 1):
+        print(f"\n{'='*60}")
+        print(f"处理月份: {month} ({month_idx}/{len(months_to_process)})")
+        print(f"{'='*60}")
+        
+        # 加载该月数据
+        repo_events = load_month_data(data_dir, month)
+        
+        if not repo_events:
+            print(f"  月份 {month} 无数据，跳过")
+            continue
+        
+        # 准备任务
+        tasks = []
+        for repo_name, events in repo_events.items():
+            if len(events) >= 3:
+                tasks.append((repo_name, events, month, graph_types, output_path))
+        
+        if not tasks:
+            print(f"  月份 {month} 无有效项目，跳过")
+            # 释放内存
+            del repo_events
+            gc.collect()
+            continue
+        
+        print(f"  {len(tasks)} 个项目待处理，使用 {workers} 个进程")
+        
+        # 并行处理该月的所有项目
+        month_graph_count = 0
+        completed = 0
+        
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_single_repo, task): task for task in tasks}
+            
+            for future in as_completed(futures):
+                completed += 1
+                try:
+                    results = future.result()
+                    for repo_name, graph_type, m, path in results:
+                        # 更新索引
+                        if repo_name not in global_index:
+                            global_index[repo_name] = {}
+                        if graph_type not in global_index[repo_name]:
+                            global_index[repo_name][graph_type] = {}
+                        global_index[repo_name][graph_type][m] = path
+                        month_graph_count += 1
+                except Exception as e:
+                    pass
+                
+                # 进度输出
+                if completed % 10 == 0 or completed == len(tasks):
+                    print(f"    进度: {completed}/{len(tasks)} 项目, {month_graph_count} 个图")
+        
+        total_graph_count += month_graph_count
+        print(f"  月份 {month} 完成: {month_graph_count} 个图")
+        
+        # 每个月处理完保存一次索引（断点续传）
+        with open(index_file, "w", encoding="utf-8") as f:
+            json.dump(global_index, f, indent=2, ensure_ascii=False)
+        print(f"  索引已更新")
+        
+        # 释放内存
+        del repo_events
+        del tasks
+        gc.collect()
+    
+    print("\n" + "=" * 60)
+    print("全部处理完成!")
+    print(f"  总计生成: {total_graph_count} 个图")
+    print(f"  涉及项目: {len(global_index)} 个")
+    print(f"  索引文件: {index_file}")
+    print("=" * 60)
+    
+    return global_index
+
+
 if __name__ == "__main__":
     import argparse
     import logging
@@ -1237,6 +1469,11 @@ if __name__ == "__main__":
         help="使用串行模式（默认使用并行）"
     )
     parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="使用流式模式：每次只加载一个月的数据，处理后释放内存，支持断点续传（推荐）"
+    )
+    parser.add_argument(
         "--start-month",
         type=str,
         default=None,
@@ -1253,6 +1490,11 @@ if __name__ == "__main__":
         action="store_true",
         help="不合并到现有索引，直接覆盖（默认会合并）"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="强制重新处理已处理的月份（仅流式模式有效）"
+    )
     
     args = parser.parse_args()
     
@@ -1262,13 +1504,29 @@ if __name__ == "__main__":
     print(f"输出目录: {args.output_dir}")
     print(f"图类型: {args.graph_types}")
     print(f"月份范围: {args.start_month or '不限'} ~ {args.end_month or '不限'}")
-    print(f"模式: {'串行' if args.serial else f'并行 ({args.workers} 进程)'}")
+    if args.streaming:
+        print(f"模式: 流式 ({args.workers} 进程/月，{'强制重处理' if args.force else '跳过已处理'})")
+    elif args.serial:
+        print(f"模式: 串行")
+    else:
+        print(f"模式: 并行 ({args.workers} 进程)")
     print("=" * 60)
     
     graph_types = [t.strip() for t in args.graph_types.split(",")]
     merge_index = not args.no_merge_index
     
-    if args.serial:
+    if args.streaming:
+        # 推荐：流式模式，按月加载处理
+        build_monthly_graphs_streaming(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            graph_types=graph_types,
+            workers=args.workers,
+            start_month=args.start_month,
+            end_month=args.end_month,
+            skip_existing=not args.force,
+        )
+    elif args.serial:
         build_monthly_graphs(
             data_dir=args.data_dir,
             output_dir=args.output_dir,

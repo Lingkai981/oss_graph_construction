@@ -13,12 +13,12 @@ ROOT_DIR = Path("/Users/milk/Documents/ali2025/oss_graph_construction")
 OUTPUT_DIR = ROOT_DIR / "output"
 
 # Summary files for scores
-BURNOUT_SUMMARY = OUTPUT_DIR / "burnout-analysis2/summary.json"
+BURNOUT_SUMMARY = OUTPUT_DIR / "burnout-analysis/summary.json"
 NEWCOMER_SUMMARY = OUTPUT_DIR / "newcomer-analysis/summary.json"
 ATMOSPHERE_SUMMARY = OUTPUT_DIR / "community-atmosphere-analysis/full_analysis.json"
 
 # Detailed files
-BURNOUT_FULL = OUTPUT_DIR / "burnout-analysis2/full_analysis.json"
+BURNOUT_FULL = OUTPUT_DIR / "burnout-analysis/full_analysis.json"
 NEWCOMER_FULL = OUTPUT_DIR / "newcomer-analysis/full_analysis.json"
 ATMOSPHERE_FULL = OUTPUT_DIR / "community-atmosphere-analysis/full_analysis.json"
 PERSONNEL_FILE = OUTPUT_DIR / "personnel-flow-all/repo_yearly_status.txt"

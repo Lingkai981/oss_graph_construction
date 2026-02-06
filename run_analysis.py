@@ -188,11 +188,12 @@ def run_atmosphere_analysis(ctx: PipelineContext) -> None:
     from src.analysis.community_atmosphere_analyzer import CommunityAtmosphereAnalyzer
 
     # 社区氛围分析依赖毒性缓存（社区氛围分析器内部固定读取 output/community-atmosphere-analysis/toxicity.json）
-    toxicity_cache = ctx.root_dir / "output" / "community-atmosphere-analysis" / "toxicity.json"
-    ensure_exists(
-        toxicity_cache,
-        "社区氛围分析所需的毒性缓存 (请先运行 --analyzers toxicity_cache 或使用 --all)",
-    )
+    # 如果文件不存在，分析器会自动降级处理（跳过毒性指标），因此不再强制检查文件存在
+    # toxicity_cache = ctx.root_dir / "output" / "community-atmosphere-analysis" / "toxicity.json"
+    # ensure_exists(
+    #     toxicity_cache,
+    #     "社区氛围分析所需的毒性缓存 (请先运行 --analyzers toxicity_cache 或使用 --all)",
+    # )
 
     ctx.atmosphere_dir.mkdir(parents=True, exist_ok=True)
     analyzer = CommunityAtmosphereAnalyzer(
@@ -615,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--graphs-dir", type=str, help="月度图数据输出目录")
     parser.add_argument("--output-dir", type=str, help="所有结果的根输出目录")
 
-    parser.add_argument("--burnout-dir", type=str, default="burnout-analysis2", help="倦怠分析输出子目录")
+    parser.add_argument("--burnout-dir", type=str, default="burnout-analysis", help="倦怠分析输出子目录")
     parser.add_argument("--newcomer-dir", type=str, default="newcomer-analysis", help="新人分析输出子目录")
     parser.add_argument("--atmosphere-dir", type=str, default="community-atmosphere-analysis", help="社区氛围输出子目录")
     parser.add_argument("--bus-factor-dir", type=str, default="bus-factor-analysis", help="Bus Factor 输出子目录")
