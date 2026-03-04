@@ -93,6 +93,7 @@ def create_schema(conn: kuzu.Connection) -> None:
             edge_type STRING,
             created_at STRING,
             comment_body STRING,
+            total_events STRING,
             repo_name STRING,
             month STRING
         );
@@ -106,6 +107,7 @@ def create_schema(conn: kuzu.Connection) -> None:
             edge_type STRING,
             created_at STRING,
             comment_body STRING,
+            total_events STRING,
             repo_name STRING,
             month STRING
         );
@@ -119,6 +121,7 @@ def create_schema(conn: kuzu.Connection) -> None:
             edge_type STRING,
             created_at STRING,
             comment_body STRING,
+            total_events STRING,
             repo_name STRING,
             month STRING
         );

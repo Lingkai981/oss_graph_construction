@@ -138,6 +138,8 @@ def collect_from_graph(
         edge_type = str(data.get("edge_type", ""))
         created_at = str(data.get("created_at", ""))
         comment_body = str(data.get("comment_body", ""))
+        # 附加图级元数据（保证不丢失数据）
+        total_events = str(g.graph.get("total_events", ""))
         row = {
             "id": str(graphml_edge_id),
             "src": u,
@@ -145,6 +147,7 @@ def collect_from_graph(
             "edge_type": edge_type,
             "created_at": created_at,
             "comment_body": comment_body,
+            "total_events": total_events,  # ✅ 添加图级元数据
             "repo_name": repo_name,
             "month": graph_month,
         }
@@ -261,6 +264,7 @@ def export_all(input_dir: Path, output_dir: Path) -> None:
         "edge_type",
         "created_at",
         "comment_body",
+        "total_events",  # ✅ 添加图级元数据
         "repo_name",
         "month",
     ], actor_actor_edges)
@@ -272,6 +276,7 @@ def export_all(input_dir: Path, output_dir: Path) -> None:
         "edge_type",
         "created_at",
         "comment_body",
+        "total_events",  # ✅ 添加图级元数据
         "repo_name",
         "month",
     ], actor_discussion_edges)
@@ -283,6 +288,7 @@ def export_all(input_dir: Path, output_dir: Path) -> None:
         "edge_type",
         "created_at",
         "comment_body",
+        "total_events",  # ✅ 添加图级元数据
         "repo_name",
         "month",
     ], actor_repo_edges)
