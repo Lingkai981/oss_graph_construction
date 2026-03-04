@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import kuzu
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,45 +136,125 @@ class BurnoutAnalyzer:
     def __init__(
         self,
         graphs_dir: str = "output/monthly-graphs/",
+        db_path: str = "output/kuzu_db.kuzu",
         output_dir: str = "output/burnout-analysis/",
     ):
         self.graphs_dir = Path(graphs_dir)
+        self.db_path = Path(db_path)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 初始化 Kuzu 连接（仅替换图数据查询来源，不改后续算法）
+        # 为兼容传入目录场景：若 db_path 是目录，则拼接默认库文件名
+        if self.db_path.is_dir():
+            self.db_path = self.db_path / "kuzu_db.kuzu"
+
+        try:
+            self.db = kuzu.Database(str(self.db_path))
+            self.conn = kuzu.Connection(self.db)
+            logger.info(f"已连接 Kuzu 数据库: {self.db_path}")
+        except Exception as e:
+            logger.error(f"连接 Kuzu 失败: {e}")
+            self.db = None
+            self.conn = None
         
         # 存储分析结果
         self.repo_metrics: Dict[str, List[MonthlyMetrics]] = defaultdict(list)
         self.alerts: List[BurnoutAlert] = []
     
-    def load_graph(self, graph_path: str) -> Optional[nx.MultiDiGraph]:
-        """加载图"""
+    def load_graph(self, repo_name: str, month: str) -> Optional[nx.MultiDiGraph]:
+        """使用 Cypher 从 Kuzu 加载单个项目单月图，并重建为 MultiDiGraph"""
+        if self.conn is None:
+            logger.error("Kuzu 连接不可用，无法加载图")
+            return None
+
         try:
-            # 兼容 Windows 生成的 index（路径使用反斜杠），在 Unix 上需规范化为正斜杠
-            normalized_path = Path(graph_path.replace("\\", "/"))
-            graph = nx.read_graphml(normalized_path)
-            # 确保返回 MultiDiGraph
-            if isinstance(graph, nx.MultiDiGraph):
+            # 查询该项目该月份的 Actor-Actor 边（完全对应原有 actor-actor 月图）
+            edge_query = """
+            MATCH (a:Actor)-[r:ActorToActor]->(b:Actor)
+            WHERE r.repo_name = $repo_name AND r.month = $month
+            RETURN a.id, a.actor_id, a.login,
+                   b.id, b.actor_id, b.login,
+                   r.id, r.edge_type, r.created_at, r.comment_body, r.total_events
+            """
+            edge_result = self.conn.execute(edge_query, {
+                "repo_name": repo_name,
+                "month": month,
+            })
+
+            graph = nx.MultiDiGraph()
+            edge_count = 0
+            total_events = None  # 用于存储图级 total_events
+
+            # ========== 方案 1: 排序稳定化 ==========
+            # 先收集所有边到列表，按 (src_id, dst_id, rel_id) 排序，确保顺序一致
+            # 这样无论从 GraphML 或 Kuzu 读取，处理顺序都相同
+            edges_list = []
+            while edge_result.has_next():
+                (
+                    src_id,
+                    src_actor_id,
+                    src_login,
+                    dst_id,
+                    dst_actor_id,
+                    dst_login,
+                    rel_id,
+                    edge_type,
+                    created_at,
+                    comment_body,
+                    edge_total_events,
+                ) = edge_result.get_next()
+
+                # 获取 total_events（所有边共享相同值，取第一个即可）
+                if total_events is None and edge_total_events:
+                    total_events = int(edge_total_events) if edge_total_events else 0
+
+                edges_list.append((
+                    src_id, src_actor_id, src_login,
+                    dst_id, dst_actor_id, dst_login,
+                    rel_id, edge_type, created_at, comment_body,
+                ))
+
+            # 按 (src_id, dst_id, rel_id) 排序以保证顺序一致
+            edges_list.sort(key=lambda e: (e[0], e[3], e[6]))
+
+            # 按排序后的顺序添加边
+            for (
+                src_id, src_actor_id, src_login,
+                dst_id, dst_actor_id, dst_login,
+                rel_id, edge_type, created_at, comment_body,
+            ) in edges_list:
+                # 先补全节点属性（重复 add_node 会更新，不影响结果）
+                graph.add_node(src_id, actor_id=src_actor_id, login=src_login, node_type="Actor")
+                graph.add_node(dst_id, actor_id=dst_actor_id, login=dst_login, node_type="Actor")
+
+                graph.add_edge(
+                    src_id,
+                    dst_id,
+                    key=rel_id,
+                    edge_type=edge_type,
+                    created_at=created_at,
+                    comment_body=comment_body,
+                )
+                edge_count += 1
+
+            # 若该月无边，与原逻辑一致返回空图（后续仍会参与流程）
+            if edge_count == 0:
+                graph.graph["repo_name"] = repo_name
+                graph.graph["month"] = month
+                graph.graph["total_events"] = 0
+                graph.graph["actor_count"] = 0
                 return graph
-            elif isinstance(graph, nx.DiGraph):
-                # 转换为 MultiDiGraph
-                multi_graph = nx.MultiDiGraph()
-                multi_graph.add_nodes_from(graph.nodes(data=True))
-                multi_graph.add_edges_from(graph.edges(data=True))
-                multi_graph.graph.update(graph.graph)
-                return multi_graph
-            elif isinstance(graph, (nx.Graph, nx.MultiGraph)):
-                # 如果是无向图，先转为有向图再转为 MultiDiGraph
-                di_graph = graph.to_directed()
-                multi_graph = nx.MultiDiGraph()
-                multi_graph.add_nodes_from(di_graph.nodes(data=True))
-                multi_graph.add_edges_from(di_graph.edges(data=True))
-                multi_graph.graph.update(di_graph.graph)
-                return multi_graph
-            else:
-                logger.warning(f"未知的图类型: {type(graph)}, 路径: {graph_path}")
-                return None
+
+            # 补充图级元数据，供既有算法直接读取
+            graph.graph["repo_name"] = repo_name
+            graph.graph["month"] = month
+            graph.graph["total_events"] = total_events if total_events is not None else 0
+            graph.graph["actor_count"] = graph.number_of_nodes()
+
+            return graph
         except Exception as e:
-            logger.warning(f"加载图失败: {graph_path}, 错误: {e}")
+            logger.warning(f"从 Kuzu 加载图失败: {repo_name}/{month}, 错误: {e}")
             return None
     
     def compute_monthly_metrics(
@@ -275,8 +356,12 @@ class BurnoutAnalyzer:
                     max_k = 1
                 
                 # 3. 计算综合得分：加权贡献量（50%）+ 网络位置（50%）
+                # ========== 关键：确保遍历节点的顺序一致 ==========
+                # 按节点 ID 排序，确保无论数据来源如何，遍历顺序都相同
+                sorted_node_ids = sorted(graph.nodes(), key=lambda n: (graph.nodes[n].get("actor_id", float('inf')), n))
+                
                 actor_scores = {}
-                for node_id in graph.nodes():
+                for node_id in sorted_node_ids:
                     weighted_degree = weighted_degrees.get(node_id, 0.0)
                     raw_degree = degrees.get(node_id, 0)  # 保留原始度数为兼容性
                     kcore = core_numbers.get(node_id, 0)
@@ -294,7 +379,7 @@ class BurnoutAnalyzer:
                         "kcore": kcore,
                     }
                 
-                # 3. 按综合得分排序
+                # 3. 按综合得分排序（完全保持原始排序逻辑）
                 sorted_actors = sorted(
                     actor_scores.items(), 
                     key=lambda x: x[1]["score"], 
@@ -719,39 +804,52 @@ class BurnoutAnalyzer:
     
     def analyze_all_repos(self) -> Dict[str, Any]:
         """分析所有项目"""
-        # 加载索引
-        index_file = self.graphs_dir / "index.json"
-        if not index_file.exists():
-            logger.error(f"索引文件不存在: {index_file}")
-            logger.info("请先运行 monthly_graph_builder.py 构建图")
+        if self.conn is None:
+            logger.error("Kuzu 连接不可用，无法开始分析")
             return {}
-        
-        with open(index_file, "r") as f:
-            index = json.load(f)
-        
-        total_repos = len(index)
+
+        print("[burnout] 正在从 Kuzu 扫描项目与月份...", flush=True)
+        # 从 Kuzu 中枚举所有 (repo, month)，替代原 index.json 遍历
+        repo_months: Dict[str, List[str]] = defaultdict(list)
+        try:
+            repo_month_query = """
+            MATCH ()-[r:ActorToActor]->()
+            RETURN DISTINCT r.repo_name, r.month
+            """
+            repo_month_result = self.conn.execute(repo_month_query)
+            while repo_month_result.has_next():
+                repo_name, month = repo_month_result.get_next()
+                if repo_name and month:
+                    repo_months[repo_name].append(month)
+        except Exception as e:
+            logger.error(f"查询项目月份失败: {e}")
+            return {}
+
+        total_repos = len(repo_months)
+        print(f"[burnout] 扫描完成，项目数: {total_repos}", flush=True)
         logger.info(f"开始分析 {total_repos} 个项目...")
         
         all_results = {}
         
-        for repo_idx, (repo_name, graph_types_data) in enumerate(index.items(), 1):
-            # 新格式: {repo: {graph_type: {month: path}}}
-            # 旧格式: {repo: {month: path}}
-            # 检测格式
-            first_value = next(iter(graph_types_data.values()), {})
-            if isinstance(first_value, dict) and not first_value.get("node_type"):
-                # 新格式，取 actor-actor 类型
-                months = graph_types_data.get("actor-actor", {})
-            else:
-                # 旧格式
-                months = graph_types_data
-            
+        for repo_idx, repo_name in enumerate(sorted(repo_months.keys()), 1):
+            months = sorted(set(repo_months[repo_name]))
+
+            print(
+                f"[burnout] [{repo_idx}/{total_repos}] {repo_name}，月份数: {len(months)}",
+                flush=True,
+            )
             logger.info(f"[{repo_idx}/{total_repos}] 分析: {repo_name} ({len(months)} 个月)")
             
             # 加载所有月份的图并计算指标
             metrics_series = []
-            for month, graph_path in sorted(months.items()):
-                graph = self.load_graph(graph_path)
+            for month_idx, month in enumerate(months, 1):
+                if month_idx == 1 or month_idx % 12 == 0 or month_idx == len(months):
+                    print(
+                        f"[burnout]    进度 {month_idx}/{len(months)}: {month}",
+                        flush=True,
+                    )
+
+                graph = self.load_graph(repo_name, month)
                 if graph is not None:
                     metrics = self.compute_monthly_metrics(graph, repo_name, month)
                     metrics_series.append(metrics)
@@ -831,6 +929,7 @@ class BurnoutAnalyzer:
     
     def run(self) -> Dict[str, Any]:
         """运行完整分析"""
+        print("[burnout] 开始维护者倦怠分析...", flush=True)
         logger.info("=" * 60)
         logger.info("开始维护者倦怠分析")
         logger.info("=" * 60)
@@ -846,6 +945,7 @@ class BurnoutAnalyzer:
         logger.info(f"总预警数: {len(self.alerts)}")
         logger.info(f"输出目录: {self.output_dir}")
         logger.info("=" * 60)
+        print(f"[burnout] 分析完成，输出目录: {self.output_dir}", flush=True)
         
         return results
 
@@ -858,7 +958,13 @@ if __name__ == "__main__":
         "--graphs-dir",
         type=str,
         default="output/monthly-graphs/",
-        help="月度图目录"
+        help="月度图目录（兼容参数，Kuzu 模式下不使用）"
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="output/kuzu_db.kuzu",
+        help="Kuzu 数据库路径"
     )
     parser.add_argument(
         "--output-dir",
@@ -871,6 +977,7 @@ if __name__ == "__main__":
     
     analyzer = BurnoutAnalyzer(
         graphs_dir=args.graphs_dir,
+        db_path=args.db_path,
         output_dir=args.output_dir,
     )
     analyzer.run()
