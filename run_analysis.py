@@ -173,11 +173,12 @@ def run_burnout_analysis(ctx: PipelineContext) -> None:
 
 def run_newcomer_analysis(ctx: PipelineContext) -> None:
     """运行新人融入与晋升路径分析，生成 full/summary 数据。"""
+    # from src.analysis.newcomer_analyzer_cypher import NewcomerAnalyzer
     from src.analysis.newcomer_analyzer import NewcomerAnalyzer
-
     ctx.newcomer_dir.mkdir(parents=True, exist_ok=True)
     analyzer = NewcomerAnalyzer(
-        graphs_dir=str(ctx.graphs_dir),
+        # graphs_dir=str(ctx.graphs_dir),
+        kuzu_db_path=str(ctx.graphs_dir),
         output_dir=str(ctx.newcomer_dir),
     )
     analyzer.run()
@@ -321,6 +322,7 @@ def run_structure_analysis(ctx: PipelineContext) -> None:
 def run_personnel_flow(ctx: PipelineContext) -> None:
     """运行人员流动分析，依赖倦怠分析产出的核心成员时间线。"""
     from src.analysis.personnel_flow import PersonnelFlowAnalyzer
+    # from src.analysis.personnel_flow_cypher import PersonnelFlowAnalyzer
 
     ctx.personnel_flow_dir.mkdir(parents=True, exist_ok=True)
     burnout_full = ctx.burnout_dir / "full_analysis.json"
@@ -330,7 +332,8 @@ def run_personnel_flow(ctx: PipelineContext) -> None:
         input_path=str(burnout_full),
         output_dir=str(ctx.personnel_flow_dir),
         scope="all",
-        graphs_dir=str(ctx.graphs_dir),
+        # graphs_dir=str(ctx.graphs_dir),
+        kuzu_db_path=str(ctx.graphs_dir),
     )
     analyzer.run(flow_months_after=ctx.args.personnel_flow_months)
 

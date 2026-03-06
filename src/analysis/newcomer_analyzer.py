@@ -1,21 +1,13 @@
 """
-Newcomer / Core-evolution analyzer (v4)
+Newcomer / Core-evolution analyzer (v2 - Kuzu 版)
 
-本版本相对 v3 的关键改动（按你的反馈）：
-1) 指标2（Periphery→Core）：排除“分析窗口第一个月就已经是核心成员”的 actor（避免 months_to_core=0 拉低均值）。
-2) 指标3（core reachability）：不可达比例的分母改为“当月所有成员数（Actor 总数）”，而不是非核心人数。
-   - 分子仍然统计“非核心成员”到 core 的不可达情况（更符合‘外围与核心的断裂’信号，同时避免 core 自身稀释信号）
-3) 三层分析方向统一为：三个指标都是“越小越好”（increase_is_bad=True）。
-   - 均值步长 / 晋核耗时 / 不可达比例：上升代表变差，评分应更低（或惩罚更高）
-   - 这里我们输出的是“惩罚分/风险分”风格：越高表示越糟（用于排序），与 burnout 的用法一致
+数据源：Kuzu 图数据库（替代 GraphML 文件）
+计算逻辑：与 v4（GraphML 版）完全一致
 
-输入：
-- 默认读取 output/monthly-graphs/index.json（新格式时仅使用 actor-actor 图）
-
-输出（output/newcomer-analysis/）：
-- full_analysis.json
-- summary.json
-
+核心改动：
+- load_graph_from_kuzu()：从 Kuzu 查询边数据，重建 NetworkX MultiDiGraph
+- PreparedMonth：恢复 graph / g_simple 字段（与 v4 一致）
+- identify_core_members / compute_* / save_results：与 v4 完全相同
 """
 
 from __future__ import annotations
@@ -29,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import kuzu
 import networkx as nx
 
 from src.utils.logger import get_logger
@@ -42,25 +35,25 @@ logger = get_logger()
 
 @dataclass
 class MonthlyCore:
-    """单月核心成员识别结果（沿用原算法输出的核心集合）"""
     month: str
     repo_name: str
-    core_node_ids: List[str] = field(default_factory=list)  # graphml node_id, e.g. "actor:123"
-    core_actor_ids: List[int] = field(default_factory=list)  # numeric actor_id
-    core_logins: List[str] = field(default_factory=list)     # login strings
+    core_node_ids: List[str] = field(default_factory=list)
+    core_actor_ids: List[int] = field(default_factory=list)
+    core_logins: List[str] = field(default_factory=list)
+
 
 @dataclass
 class PreparedMonth:
     month: str
-    path: str
-    graph: nx.MultiDiGraph
-    g_simple: nx.Graph
+    repo_name: str
+    graph: nx.MultiDiGraph        # 有向多重图（原始）
+    g_simple: nx.Graph            # 无向简单图（用于最短路径）
     core_node_ids: List[str]
-    actor_nodes: List[str]  # 当月 Actor 节点（用于 reachability）
+    actor_nodes: List[str]        # 当月所有 Actor 节点 ID（去重）
+
 
 @dataclass
 class NewcomerDistanceRecord:
-    """新人加入时到核心成员的平均最短路径长度"""
     repo_name: str
     join_month: str
     newcomer_node_id: str
@@ -85,7 +78,6 @@ class NewcomerDistanceRecord:
 
 @dataclass
 class PeripheryToCoreRecord:
-    """核心成员从首次出现到首次成为 core 的耗时（月）"""
     repo_name: str
     actor_node_id: str
     actor_id: int
@@ -109,9 +101,7 @@ class PeripheryToCoreRecord:
 @dataclass
 class CoreReachabilityMonthlySummary:
     """
-    非核心成员到核心成员的可达性统计（按月）
-
-    注意：不可达“比例”的分母是当月所有 Actor 总数（total_actor_count），而不是 non_core_count。
+    分母为当月所有 Actor 总数（total_actor_count），与 v4 一致。
     """
     repo_name: str
     month: str
@@ -137,11 +127,10 @@ class CoreReachabilityMonthlySummary:
 
 
 # =========================
-# 工具函数
+# 工具函数（与 v4 完全相同）
 # =========================
 
 def _parse_actor_id(value: Any) -> int:
-    """GraphML 节点属性 actor_id 可能是 str/int/float，做一次稳健转换。"""
     try:
         if value is None:
             return 0
@@ -162,19 +151,16 @@ def _month_to_dt(month: str) -> datetime:
 
 
 def _months_diff(start_month: str, end_month: str) -> int:
-    """end - start in months"""
     s = _month_to_dt(start_month)
     e = _month_to_dt(end_month)
     return (e.year - s.year) * 12 + (e.month - s.month)
 
 
 def _to_undirected_simple(graph: nx.MultiDiGraph) -> nx.Graph:
-    """将 MultiDiGraph 转为无向简单图：忽略方向、合并平行边。"""
     return nx.Graph(graph.to_undirected())
 
 
 def _linear_regression_slope(values: List[float]) -> float:
-    """简单线性回归斜率（x=0..n-1）。"""
     n = len(values)
     if n < 2:
         return 0.0
@@ -191,7 +177,6 @@ def _linear_regression_slope(values: List[float]) -> float:
 
 
 def _compute_volatility(values: List[float]) -> float:
-    """环比变化率标准差；跳过 prev<=0。"""
     if len(values) < 3:
         return 0.0
     changes: List[float] = []
@@ -218,15 +203,6 @@ def compute_three_layer_analysis(
     volatility_threshold: float = 0.3,
     increase_is_bad: bool = True,
 ) -> Dict[str, Any]:
-    """
-    三层分析（长期趋势/近期状态/稳定性），返回可解释的“惩罚/风险分”。
-    - increase_is_bad=True 表示“越大越差”（本项目的三个指标都满足这一点）
-      - 趋势：slope 越大惩罚越大
-      - 近期：change 越大惩罚越大
-    - increase_is_bad=False 表示“越小越差”（保留扩展性）
-
-    None 会被过滤；n_points 是有效数据点数。
-    """
     clean = [v for v in values if v is not None]
     n = len(clean)
     if n < 2:
@@ -238,7 +214,6 @@ def compute_three_layer_analysis(
             "total_score": 0.0,
         }
 
-    # 归一化（与 burnout 一致）：以首个非零值为基准
     base = None
     for v in clean:
         if v != 0:
@@ -255,7 +230,6 @@ def compute_three_layer_analysis(
 
     volatility = _compute_volatility(clean)
 
-    # 映射到“惩罚/风险分”：越高越差
     if increase_is_bad:
         trend_score = max(0.0, min(max_score * 0.4, slope * max_score * 4))
         recent_score = max(0.0, min(max_score * 0.4, change * max_score * 0.4))
@@ -291,81 +265,102 @@ def compute_three_layer_analysis(
 
 class NewcomerAnalyzer:
     """
-    计算三类指标：
-    1) newcomer -> core 平均最短路径长度（加入当月）
-    2) periphery -> core 平均耗时（月），并提供“每月新晋核心”的月度序列（方案A）
-    3) non-core -> core 不可达统计（any/all），比例分母为当月 Actor 总数
+    与 v4 逻辑完全相同，仅数据来源从 GraphML 改为 Kuzu 数据库。
+    步骤：
+      1. load_graph_from_kuzu()  → 查询 Kuzu 边，重建 nx.MultiDiGraph
+      2. prepare_monthly_data()  → 预计算 core、g_simple、actor_nodes（与 v4 相同）
+      3. compute_*()             → 三个指标计算（与 v4 完全相同）
+      4. save_results()          → 三层分析 + health_score（与 v4 完全相同）
     """
 
     def __init__(
         self,
-        graphs_dir: str = "output/monthly-graphs/",
+        kuzu_db_path: str = "output/kuzu_db",
         output_dir: str = "output/newcomer-analysis/",
     ):
-        self.graphs_dir = Path(graphs_dir)
+        self.kuzu_db_path = kuzu_db_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.db = kuzu.Database(str(self.kuzu_db_path))
+        self.conn = kuzu.Connection(self.db)
 
-    # ---------- IO ----------
+    # ---------- 数据加载（唯一与 v4 不同之处） ----------
 
-    def load_graph(self, graph_path: str) -> Optional[nx.MultiDiGraph]:
+    def load_graph_from_kuzu(self, repo_name: str, month: str) -> Optional[nx.MultiDiGraph]:
+        """
+        从 Kuzu 查询 Actor-Actor 边，重建 nx.MultiDiGraph。
+        节点属性：node_type="Actor", actor_id, login
+        边属性与 v4 一致（只需有向边存在即可）。
+        """
+        query = f"""
+        MATCH (a:Actor)-[r:ActorToActor]->(b:Actor)
+        WHERE r.repo_name = "{repo_name}" AND r.month = "{month}"
+        RETURN a.id, a.actor_id, a.login, b.id, b.actor_id, b.login
+        """
         try:
-            return nx.read_graphml(graph_path)
+            result = self.conn.execute(query)
+            G = nx.MultiDiGraph()
+            while result.has_next():
+                row = result.get_next()
+                a_id, a_actor_id, a_login, b_id, b_actor_id, b_login = row
+
+                # 添加节点（若已存在则跳过，避免覆盖已有属性）
+                if not G.has_node(str(a_id)):
+                    G.add_node(str(a_id),
+                               node_type="Actor",
+                               actor_id=_parse_actor_id(a_actor_id),
+                               login=str(a_login) if a_login else str(a_id))
+                if not G.has_node(str(b_id)):
+                    G.add_node(str(b_id),
+                               node_type="Actor",
+                               actor_id=_parse_actor_id(b_actor_id),
+                               login=str(b_login) if b_login else str(b_id))
+
+                G.add_edge(str(a_id), str(b_id))
+
+            if G.number_of_nodes() == 0:
+                return None
+            return G
+
         except Exception as e:
-            logger.warning(f"加载图失败: {graph_path}, 错误: {e}")
+            logger.warning(f"从 Kuzu 加载图数据失败: {repo_name} {month}, 错误: {e}")
             return None
 
     def _load_index(self) -> Dict[str, Any]:
-        index_file = self.graphs_dir / "index.json"
+        index_file = Path("output/monthly-graphs/index.json")
         if not index_file.exists():
             logger.error(f"索引文件不存在: {index_file}")
-            logger.info("请先运行 monthly_graph_builder.py 构建图")
             return {}
         with open(index_file, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def _get_actor_actor_months(self, graph_types_data: Any) -> Dict[str, str]:
         """
-        从 index.json 的 repo 记录中解析出“用于分析的 actor-actor 月度图 {month: path}”。
-
-        你当前的 index.json 常见结构是：
-        - 结构A（多图类型）: {repo: {graph_type: {month: path}}}
-          例如 graph_type 可能是 "actor-discussion", "actor-actor", "actor-repo" 等
-        - 结构B（单层旧格式）: {repo: {month: path}}
-
-        本分析只适用于“节点全部是 Actor”的图（actor-actor 类）。
-        因此优先选择下列类型（按优先级）：
-        1) actor-actor
-        2) actor-discussion
-        3) actor-comment / actor-issue / actor-pr / actor-review（如果存在）
-        若以上都没有，则会尝试从 graph_types_data 里找出“看起来像 month->path 的 dict”。
+        解析 index.json 获取月份列表（仅需 month key，path 不再使用）。
+        兼容新旧两种 index.json 结构。
         """
         if not isinstance(graph_types_data, dict) or not graph_types_data:
             return {}
 
-        # 如果 keys 看起来就是月份（YYYY-MM），则认为已经是 {month: path}
         def _looks_like_month(s: str) -> bool:
-            return isinstance(s, str) and len(s) == 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit()
+            return isinstance(s, str) and len(s) == 7 and s[4] == "-" \
+                   and s[:4].isdigit() and s[5:7].isdigit()
 
         # 结构B：直接 month->path
         if all(_looks_like_month(k) for k in graph_types_data.keys()):
             return {k: v for k, v in graph_types_data.items() if isinstance(v, (str, bytes))}
 
-        # 结构A：graph_type -> {month: path}
+        # 结构A：graph_type -> {month: path}，优先 actor-actor
         preferred_types = [
-            "actor-actor",
-            "actor-discussion",
-            "actor-comment",
-            "actor-issue",
-            "actor-pr",
-            "actor-review",
+            "actor-actor", "actor-discussion", "actor-comment",
+            "actor-issue", "actor-pr", "actor-review",
         ]
         for t in preferred_types:
             v = graph_types_data.get(t)
             if isinstance(v, dict) and v:
                 return {k: p for k, p in v.items() if _looks_like_month(k) and isinstance(p, (str, bytes))}
 
-        # fallback：在所有子 dict 里找一个最像 month->path 的
+        # fallback
         candidates = []
         for t, v in graph_types_data.items():
             if not isinstance(v, dict) or not v:
@@ -387,16 +382,16 @@ class NewcomerAnalyzer:
         month_to_graph_path: Dict[str, str],
     ) -> List[PreparedMonth]:
         """
-        每个 repo：对每个月份图只做一次 IO + 一次预计算（无向图、core、actor_nodes）
+        每个月份：从 Kuzu 加载图 → 预计算 core、g_simple、actor_nodes。
+        PreparedMonth 结构与 v4 完全一致，后续计算方法零修改。
         """
         prepared: List[PreparedMonth] = []
         for month in sorted(month_to_graph_path.keys()):
-            path = month_to_graph_path[month]
-            graph = self.load_graph(path)
+            # 从 Kuzu 重建 NetworkX 图（替代 v4 的 nx.read_graphml）
+            graph = self.load_graph_from_kuzu(repo_name, month)
             if graph is None or graph.number_of_nodes() == 0:
                 continue
 
-            # 只做一次
             core_node_ids, _, _ = self.identify_core_members(graph)
             g_simple = _to_undirected_simple(graph)
             actor_nodes = [
@@ -406,7 +401,7 @@ class NewcomerAnalyzer:
 
             prepared.append(PreparedMonth(
                 month=month,
-                path=path,
+                repo_name=repo_name,
                 graph=graph,
                 g_simple=g_simple,
                 core_node_ids=core_node_ids,
@@ -414,21 +409,9 @@ class NewcomerAnalyzer:
             ))
         return prepared
 
-    # ---------- 核心成员识别（沿用原算法） ----------
+    # ---------- 核心成员识别（与 v4 完全相同） ----------
 
     def identify_core_members(self, graph: nx.MultiDiGraph) -> Tuple[List[str], List[int], List[str]]:
-        """
-        返回：(core_node_ids, core_actor_ids, core_logins)
-
-        算法来自 burnout_analyzer.py：
-        - k-core（无向）
-        - score = 0.6*degree_norm + 0.4*kcore_norm
-        - 三重约束：
-          * 累计 degree >= 70% total_degree
-          * 核心人数 <= max(3, 30% actors)
-          * score < 平均分 且已有>=3 人则停止
-        - 最少补到 2 人
-        """
         if graph.number_of_nodes() == 0:
             return [], [], []
 
@@ -441,7 +424,6 @@ class NewcomerAnalyzer:
         total_degree = sum(degree_values)
         total_actors = len(degrees)
 
-        # k-core 分解
         try:
             undirected = graph.to_undirected()
             core_numbers = nx.core_number(undirected)
@@ -459,7 +441,11 @@ class NewcomerAnalyzer:
             score = 0.6 * degree_norm + 0.4 * kcore_norm
             actor_scores[node_id] = {"score": score, "degree": deg, "kcore": kcore}
 
-        sorted_actors = sorted(actor_scores.items(), key=lambda x: x[1]["score"], reverse=True)
+        # sorted_actors = sorted(actor_scores.items(), key=lambda x: x[1]["score"], reverse=True)
+        sorted_actors = sorted(
+            actor_scores.items(),
+            key=lambda x: (-x[1]["score"], x[0]),  # score 降序，node_id 升序
+        )
 
         contribution_threshold = total_degree * 0.7
         max_core_count = max(3, int(total_actors * 0.3))
@@ -488,7 +474,7 @@ class NewcomerAnalyzer:
             core_logins.append(str(login))
             cumsum += float(sdata.get("degree", 0))
 
-        # 至少 2 个核心成员（补齐）
+        # 至少补齐 2 个核心成员
         if len(core_node_ids) < 2 and len(sorted_actors) >= 2:
             for node_id, _ in sorted_actors[:2]:
                 if node_id in core_node_ids:
@@ -502,22 +488,16 @@ class NewcomerAnalyzer:
 
         return core_node_ids, core_actor_ids, core_logins
 
-    # ---------- 指标1：新人加入时到核心平均路径 ----------
+    # ---------- 指标1：新人到核心平均路径（与 v4 完全相同） ----------
 
     def compute_newcomer_distances_for_repo(
         self,
         repo_name: str,
         prepared_months: List[PreparedMonth],
     ) -> Tuple[List[NewcomerDistanceRecord], List[Dict[str, Any]]]:
-        """
-        返回：
-        - newcomer records（每个新人一条）
-        - monthly summary（每月新人均值/数量）
-        """
         newcomer_records: List[NewcomerDistanceRecord] = []
         monthly_summary: List[Dict[str, Any]] = []
-
-        first_seen: Dict[str, str] = {}  # node_id -> first month
+        first_seen: Dict[str, str] = {}
 
         for pm in prepared_months:
             month = pm.month
@@ -527,15 +507,13 @@ class NewcomerAnalyzer:
 
             core_node_ids = pm.core_node_ids
             g_simple = pm.g_simple
-
             newcomers_this_month: List[NewcomerDistanceRecord] = []
+
             for node_id, attr in graph.nodes(data=True):
                 if str(attr.get("node_type", "Actor")) != "Actor":
                     continue
-
                 if node_id not in first_seen:
                     first_seen[node_id] = month
-
                     newcomer_login = str(attr.get("login", node_id))
                     newcomer_actor_id = _parse_actor_id(attr.get("actor_id", 0))
 
@@ -560,8 +538,10 @@ class NewcomerAnalyzer:
                     lengths = nx.single_source_shortest_path_length(g_simple, node_id)
                     reachable = [lengths[t] for t in core_targets if t in lengths]
                     reachable_count = len(reachable)
-
-                    avg_len: Optional[float] = None if reachable_count == 0 else round(sum(reachable) / reachable_count, 4)
+                    avg_len: Optional[float] = (
+                        None if reachable_count == 0
+                        else round(sum(reachable) / reachable_count, 4)
+                    )
 
                     rec = NewcomerDistanceRecord(
                         repo_name=repo_name,
@@ -590,20 +570,13 @@ class NewcomerAnalyzer:
 
         return newcomer_records, monthly_summary
 
-    # ---------- 指标2：periphery->core 平均耗时（排除首月即 core） ----------
+    # ---------- 指标2：外围→核心耗时（与 v4 完全相同，含首月过滤） ----------
 
     def compute_periphery_to_core_for_repo(
         self,
         repo_name: str,
         prepared_months: List[PreparedMonth],
     ) -> Tuple[List[PeripheryToCoreRecord], Optional[float], List[Dict[str, Any]]]:
-        """
-        对“曾经成为核心成员”的 actor，计算其：
-        months_to_core = first_core_month - first_seen_month
-
-        v4 改动：排除“分析窗口第一个月就已经是核心成员”的 actor：
-        - 条件：first_core_month == first_month AND first_seen_month == first_month
-        """
         first_seen: Dict[str, str] = {}
         first_core: Dict[str, str] = {}
         actor_info: Dict[str, Tuple[int, str]] = {}
@@ -614,9 +587,8 @@ class NewcomerAnalyzer:
         first_month = months_sorted[0]
 
         for pm in prepared_months:
-            graph = pm.graph 
+            graph = pm.graph
             month = pm.month
-            
             if graph is None or graph.number_of_nodes() == 0:
                 continue
 
@@ -626,10 +598,12 @@ class NewcomerAnalyzer:
                 if node_id not in first_seen:
                     first_seen[node_id] = month
                 if node_id not in actor_info:
-                    actor_info[node_id] = (_parse_actor_id(attr.get("actor_id", 0)), str(attr.get("login", node_id)))
+                    actor_info[node_id] = (
+                        _parse_actor_id(attr.get("actor_id", 0)),
+                        str(attr.get("login", node_id)),
+                    )
 
-            core_node_ids = pm.core_node_ids
-            for c in core_node_ids:
+            for c in pm.core_node_ids:
                 if c not in first_core:
                     first_core[c] = month
 
@@ -650,7 +624,7 @@ class NewcomerAnalyzer:
                 months_to_core=months_to_core,
             ))
 
-        # v4：过滤“首月即 core”
+        # v4 改动：排除"分析窗口首月即为核心"的成员
         records = [
             r for r in records_all
             if not (r.first_seen_month == first_month and r.first_core_month == first_month)
@@ -658,7 +632,6 @@ class NewcomerAnalyzer:
 
         overall_avg = round(sum(r.months_to_core for r in records) / len(records), 4) if records else None
 
-        # 方案A：按“每月新晋核心成员（first_core_month == month）”构造月度序列（基于过滤后的 records）
         by_month: Dict[str, List[int]] = defaultdict(list)
         for r in records:
             by_month[r.first_core_month].append(r.months_to_core)
@@ -685,27 +658,14 @@ class NewcomerAnalyzer:
 
         return records, overall_avg, monthly_summary
 
-    # ---------- 指标3：非核心成员与核心成员可达性（比例分母为当月所有成员数） ----------
+    # ---------- 指标3：非核心→核心可达性（与 v4 完全相同） ----------
 
     def compute_core_reachability_for_repo(
         self,
         repo_name: str,
         prepared_months: List[PreparedMonth],
     ) -> Tuple[List[CoreReachabilityMonthlySummary], Dict[str, Any]]:
-        """
-        统计“非核心成员到核心成员”的不可达情况（按月 + 全局汇总）
-
-        对每个月：
-        - total_actor_count：当月 Actor 总数（分母）
-        - non_core_count：当月非核心 actor 数（分子统计对象集合）
-        - unreachable_to_all_core_count：与所有 core 都不可达（reachable_core_count == 0）
-        - unreachable_to_any_core_count：与至少一个 core 不可达（reachable_core_count < total_core_count）
-
-        全局汇总：
-        - 对所有月份做加权汇总（按月累加分子/分母）
-        """
         monthly: List[CoreReachabilityMonthlySummary] = []
-
         total_actor_sum = 0
         total_unreach_all = 0
         total_unreach_any = 0
@@ -716,15 +676,12 @@ class NewcomerAnalyzer:
             if graph is None or graph.number_of_nodes() == 0:
                 continue
 
-            # 当月 Actor 总数（分母）
             actor_nodes = pm.actor_nodes
             total_actor_count = len(actor_nodes)
-
             core_node_ids = pm.core_node_ids
             core_targets = list(core_node_ids)
             total_core = len(core_targets)
 
-            # 没有 core 时：不可达无定义（当月输出 None-rate 的占位）
             if total_core == 0:
                 monthly.append(CoreReachabilityMonthlySummary(
                     repo_name=repo_name,
@@ -740,7 +697,6 @@ class NewcomerAnalyzer:
 
             core_set = set(core_targets)
             g_simple = pm.g_simple
-
             non_core_nodes = [n for n in actor_nodes if n not in core_set]
 
             unreach_all = 0
@@ -781,7 +737,7 @@ class NewcomerAnalyzer:
 
         return monthly, overall
 
-    # ---------- 总流程 ----------
+    # ---------- 总流程（与 v4 完全相同） ----------
 
     def analyze_all_repos(self) -> Dict[str, Any]:
         index = self._load_index()
@@ -808,12 +764,10 @@ class NewcomerAnalyzer:
             periphery_records, avg_months_to_core, p2c_monthly = self.compute_periphery_to_core_for_repo(repo_name, prepared_months)
             reach_monthly, reach_overall = self.compute_core_reachability_for_repo(repo_name, prepared_months)
 
-
-            # overall newcomer avg（只对有值的）
             newcomer_vals = [r.avg_shortest_path_to_core for r in newcomer_records if r.avg_shortest_path_to_core is not None]
             overall_newcomer_avg = round(sum(newcomer_vals) / len(newcomer_vals), 4) if newcomer_vals else None
 
-            # ===== 三层分析：三个指标都是“越小越好” => increase_is_bad=True =====
+            # 三层分析（三个指标均为"越大越差"）
             newcomer_series = [m.get("avg_shortest_path_to_core") for m in newcomer_monthly]
             newcomer_three_layer = compute_three_layer_analysis(newcomer_series, max_score=25.0, increase_is_bad=True)
 
@@ -828,7 +782,7 @@ class NewcomerAnalyzer:
 
             results[repo_name] = {
                 "repo_name": repo_name,
-                "graph_type_used": "actor-actor",
+                "graph_type_used": "actor-actor (kuzu)",
                 "three_layer_analysis": {
                     "newcomer_distance": newcomer_three_layer,
                     "periphery_to_core_monthly": p2c_three_layer,
@@ -847,7 +801,7 @@ class NewcomerAnalyzer:
                 },
                 "core_reachability": {
                     "overall": reach_overall,
-                    "monthly_summary": [m.to_dict() for m in reach_monthly],
+                    "monthly_summary": reach_monthly_dicts,
                 },
             }
 
@@ -867,8 +821,7 @@ class NewcomerAnalyzer:
             three = data.get("three_layer_analysis", {}) or {}
 
             reach_overall = reach.get("overall", {}) or {}
-            
-            # 计算风险分
+
             risk_scores = [
                 (three.get("newcomer_distance", {}) or {}).get("total_score", 0),
                 (three.get("periphery_to_core_monthly", {}) or {}).get("total_score", 0),
@@ -876,8 +829,6 @@ class NewcomerAnalyzer:
                 (three.get("unreachable_to_any_core_rate", {}) or {}).get("total_score", 0),
             ]
             total_risk = sum(risk_scores)
-            
-            # 计算健康分 (100 - 风险分), 越高越好
             health_score = max(0.0, 100.0 - total_risk)
 
             summary.append({
@@ -891,17 +842,14 @@ class NewcomerAnalyzer:
                 "core_member_count_ever": len(p2c.get("records", []) or []),
                 "overall_unreachable_to_all_core_rate": reach_overall.get("overall_unreachable_to_all_core_rate"),
                 "overall_unreachable_to_any_core_rate": reach_overall.get("overall_unreachable_to_any_core_rate"),
-
                 "three_layer_newcomer_distance_score": risk_scores[0],
                 "three_layer_periphery_to_core_monthly_score": risk_scores[1],
                 "three_layer_unreachable_to_all_core_rate_score": risk_scores[2],
                 "three_layer_unreachable_to_any_core_rate_score": risk_scores[3],
-                
                 "total_risk_score": total_risk,
-                "health_score": health_score  # 新增健康分
+                "health_score": health_score,
             })
 
-        # 排序：按健康分从高到低
         summary.sort(key=lambda x: x["health_score"], reverse=True)
 
         summary_file = self.output_dir / "summary.json"
@@ -911,7 +859,7 @@ class NewcomerAnalyzer:
 
     def run(self) -> Dict[str, Any]:
         logger.info("=" * 60)
-        logger.info("开始 Newcomer / Core-evolution 分析 (v4)")
+        logger.info("开始 Newcomer / Core-evolution 分析 (v2-Kuzu)")
         logger.info("=" * 60)
 
         results = self.analyze_all_repos()
@@ -929,14 +877,14 @@ class NewcomerAnalyzer:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Newcomer / Core-evolution 分析 (v4)")
-    parser.add_argument("--graphs-dir", type=str, default="output/monthly-graphs/", help="月度图目录")
+    parser = argparse.ArgumentParser(description="Newcomer / Core-evolution 分析 (v2-Kuzu)")
+    parser.add_argument("--kuzu-db", type=str, default="output/kuzu_db", help="Kuzu 数据库目录路径")
     parser.add_argument("--output-dir", type=str, default="output/newcomer-analysis/", help="输出目录")
 
     args = parser.parse_args()
 
     analyzer = NewcomerAnalyzer(
-        graphs_dir=args.graphs_dir,
+        kuzu_db_path=args.kuzu_db,
         output_dir=args.output_dir,
     )
     analyzer.run()

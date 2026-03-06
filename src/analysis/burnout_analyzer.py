@@ -136,7 +136,8 @@ class BurnoutAnalyzer:
     def __init__(
         self,
         graphs_dir: str = "output/monthly-graphs/",
-        db_path: str = "output/kuzu_db.kuzu",
+        db_path: str = "output/kuzu_db.kuzu"
+        # db_path: str = "output/kuzu_db",
         output_dir: str = "output/burnout-analysis/",
     ):
         self.graphs_dir = Path(graphs_dir)
@@ -148,6 +149,7 @@ class BurnoutAnalyzer:
         # 为兼容传入目录场景：若 db_path 是目录，则拼接默认库文件名
         if self.db_path.is_dir():
             self.db_path = self.db_path / "kuzu_db.kuzu"
+            # self.db_path = self.db_path / "kuzu_db"
 
         try:
             self.db = kuzu.Database(str(self.db_path))
@@ -964,6 +966,7 @@ if __name__ == "__main__":
         "--db-path",
         type=str,
         default="output/kuzu_db.kuzu",
+        # default="output/kuzu_db",
         help="Kuzu 数据库路径"
     )
     parser.add_argument(
