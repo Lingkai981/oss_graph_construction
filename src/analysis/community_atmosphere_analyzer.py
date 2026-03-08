@@ -15,6 +15,22 @@
 - 社区氛围综合评分（后续由大模型基于指标数据评分）
 """
 
+"""
+需要 nx/图算法竞品补齐的是：
+1. 聚类系数
+
+2. 连通性相关
+is_connected 是否连通
+num_connected_components 连通分量数量
+largest_component_size 最大连通分量大小
+需要图遍历/连通分量算法。
+
+3. 网络直径相关
+diameter 网络直径
+average_path_length 平均最短路径长度
+需要最短路分布。
+"""
+
 from __future__ import annotations
 
 import json

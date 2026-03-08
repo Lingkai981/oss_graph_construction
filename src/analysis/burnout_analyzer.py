@@ -13,6 +13,14 @@
 - 预警列表
 """
 
+"""
+真正需要 nx（、而不是“Cypher + 普通内存聚合”就能完成的：
+
+1. 聚类系数（clustering_coefficient）
+对应 nx.clustering(...) / nx.average_clustering(...) 这类三角闭包计算。这不是简单计数聚合，属于图结构算法。
+2. k-core （用于核心成员识别）
+"""
+
 from __future__ import annotations
 
 import json
@@ -381,9 +389,8 @@ class BurnoutAnalyzer:
                 
                 # 3. 按综合得分排序（完全保持原始排序逻辑）
                 sorted_actors = sorted(
-                    actor_scores.items(), 
-                    key=lambda x: x[1]["score"], 
-                    reverse=True
+                    actor_scores.items(),
+                    key=lambda x: (-x[1]["score"], x[0]),  # score 降序，node_id 升序
                 )
                 
                 # 4. 动态确定核心成员数量（双重约束）
