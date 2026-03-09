@@ -15,6 +15,20 @@
 - 社区氛围综合评分（后续由大模型基于指标数据评分）
 """
 
+# 需要 nx/图算法竞品补齐的是：
+# 1. 聚类系数
+#
+# 2. 连通性相关
+# is_connected 是否连通
+# num_connected_components 连通分量数量
+# largest_component_size 最大连通分量大小
+# 需要图遍历/连通分量算法。
+#
+# 3. 网络直径相关
+# diameter 网络直径
+# average_path_length 平均最短路径长度
+# 需要最短路分布。
+
 from __future__ import annotations
 
 import json
@@ -28,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import networkx as nx
+import kuzu
 
 from src.algorithms.clustering_coefficient import compute_clustering_coefficient
 # 注释掉情绪传播算法，已替换为毒性分析
@@ -63,6 +78,7 @@ class CommunityAtmosphereAnalyzer:
     def __init__(
         self,
         graphs_dir: str = "output/monthly-graphs/",
+        db_path: str = "output/kuzu_db.kuzu",
         output_dir: str = "output/community-atmosphere-analysis/",
         use_top30: bool = False,
     ):
@@ -75,8 +91,22 @@ class CommunityAtmosphereAnalyzer:
             use_top30: 是否只分析 Top30 仓库，默认 False（分析所有仓库）
         """
         self.graphs_dir = Path(graphs_dir)
+        self.db_path = Path(db_path)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 初始化 Kuzu 连接（与 burnout_analyzer 保持一致）
+        if self.db_path.is_dir():
+            self.db_path = self.db_path / "kuzu_db.kuzu"
+
+        try:
+            self.db = kuzu.Database(str(self.db_path))
+            self.conn = kuzu.Connection(self.db)
+            logger.info(f"已连接 Kuzu 数据库: {self.db_path}")
+        except Exception as e:
+            logger.error(f"连接 Kuzu 失败: {e}")
+            self.db = None
+            self.conn = None
         
         # 存储分析结果
         self.repo_metrics: Dict[str, List[MonthlyAtmosphereMetrics]] = defaultdict(list)
@@ -326,15 +356,17 @@ class CommunityAtmosphereAnalyzer:
         # {item_id: {"created_at": datetime, "first_response_at": datetime|None}}
         items_timeline: Dict[str, Dict[str, Any]] = {}
         
-        # 遍历所有边，统计边类型和收集时间线数据
+        # 将边转换为列表以支持多次迭代
+        # 原因：需要先找所有 CREATED_* 边来初始化 items_timeline，
+        # 然后再处理 COMMENTED_* 边来更新响应时间。
+        # 这确保即使边在图中的存储顺序不同，也能正确计算。
         if isinstance(discussion_graph, nx.MultiDiGraph):
-            edges_iter = discussion_graph.edges(keys=True, data=True)
-            edge_key_func = lambda u, v, k, d: (u, v, k, d)
+            all_edges = list(discussion_graph.edges(keys=True, data=True))
         else:
-            edges_iter = discussion_graph.edges(data=True)
-            edge_key_func = lambda u, v, d: (u, v, None, d)
+            all_edges = [(u, v, None, d) for u, v, d in discussion_graph.edges(data=True)]
         
-        for edge_data in edges_iter:
+        # ========== 第一遍扫描：初始化 items_timeline 和统计计数 ==========
+        for edge_data in all_edges:
             if len(edge_data) == 4:
                 u, v, key, data = edge_data
             else:
@@ -356,7 +388,7 @@ class CommunityAtmosphereAnalyzer:
                 except (ValueError, TypeError):
                     pass
             
-            # 统计变更请求类型
+            # 统计变更请求类型和初始化时间线
             # 注意：GraphML 中使用 CREATED_PR/CREATED_ISSUE 而非 OPENED_PR/OPENED_ISSUE
             if edge_type == "CREATED_PR":
                 opened_prs += 1
@@ -380,8 +412,32 @@ class CommunityAtmosphereAnalyzer:
                     
             elif edge_type == "CLOSED_ISSUE":
                 closed_issues += 1
-                
-            elif edge_type in ("COMMENTED_ISSUE", "COMMENTED_PR", "REVIEWED_PR"):
+        
+        # ========== 第二遍扫描：更新响应时间 ==========
+        for edge_data in all_edges:
+            if len(edge_data) == 4:
+                u, v, key, data = edge_data
+            else:
+                u, v, data = edge_data
+                key = None
+            
+            edge_type = data.get("edge_type", "")
+            created_at_str = data.get("created_at", "")
+            
+            # 解析时间戳
+            created_at = None
+            if created_at_str:
+                try:
+                    if "T" in created_at_str:
+                        created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                    else:
+                        created_at = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    pass
+            
+            # 处理响应边（评论或审查）
+            # 现在所有 CREATED_* 项都已经在 items_timeline 中了
+            if edge_type in ("COMMENTED_ISSUE", "COMMENTED_PR", "REVIEWED_PR"):
                 # 评论/Review 表示响应
                 # v 是 Issue/PR 节点 ID
                 if v in items_timeline:
@@ -463,46 +519,244 @@ class CommunityAtmosphereAnalyzer:
             "items_without_response": items_without_response,
         }
     
-    def load_graph(self, graph_path: str) -> Optional[nx.Graph]:
-        """
-        加载GraphML图文件
-        
-        Args:
-            graph_path: 图文件路径（可能是相对路径）
-        
-        Returns:
-            NetworkX MultiDiGraph对象，如果加载失败返回None
-        """
+    def _scan_repo_months_from_kuzu(self) -> Dict[str, List[str]]:
+        """从 Kuzu 扫描可分析的 (repo, month)，要求同时存在 actor-discussion 与 actor-actor 边。"""
+        if self.conn is None:
+            logger.error("Kuzu 连接不可用，无法扫描项目月份")
+            return {}
+
+        discussion_pairs = set()
+        actor_pairs = set()
+
         try:
-            # 解析路径：index.json 中的路径是相对于项目根目录的
-            # 例如: "output\\monthly-graphs\\angular-angular\\actor-discussion\\2023-01.graphml"
-            path_obj = Path(graph_path)
-            
-            # 如果是绝对路径，直接使用
-            if path_obj.is_absolute():
-                resolved_path = path_obj
-            else:
-                # 相对路径：先尝试相对于当前工作目录
-                resolved_path = Path.cwd() / path_obj
-                # 如果不存在，尝试相对于 graphs_dir 的父目录（项目根目录）
-                if not resolved_path.exists():
-                    # 从 graphs_dir 推断项目根目录
-                    # graphs_dir 通常是 "output/monthly-graphs/"
-                    # 项目根目录应该是 graphs_dir 的父目录的父目录
-                    project_root = self.graphs_dir.parent.parent if self.graphs_dir.name == "monthly-graphs" else self.graphs_dir.parent
-                    resolved_path = project_root / path_obj
-            
-            if not resolved_path.exists():
-                logger.warning(f"图文件不存在: {resolved_path} (原始路径: {graph_path}, 当前目录: {Path.cwd()})")
-                return None
-            
-            logger.info(f"正在加载图文件: {resolved_path}")
-            logger.info(f"图文件大小: {resolved_path.stat().st_size / 1024 / 1024:.2f} MB")
-            graph = nx.read_graphml(str(resolved_path))
-            logger.info(f"成功加载图文件: 节点数={graph.number_of_nodes()}, 边数={graph.number_of_edges()}")
+            discussion_query = """
+            MATCH ()-[r:ActorToDiscussion]->()
+            RETURN DISTINCT r.repo_name, r.month
+            """
+            discussion_result = self.conn.execute(discussion_query)
+            while discussion_result.has_next():
+                repo_name, month = discussion_result.get_next()
+                if repo_name and month:
+                    discussion_pairs.add((str(repo_name), str(month)))
+
+            actor_query = """
+            MATCH ()-[r:ActorToActor]->()
+            RETURN DISTINCT r.repo_name, r.month
+            """
+            actor_result = self.conn.execute(actor_query)
+            while actor_result.has_next():
+                repo_name, month = actor_result.get_next()
+                if repo_name and month:
+                    actor_pairs.add((str(repo_name), str(month)))
+        except Exception as e:
+            logger.error(f"扫描 Kuzu 项目月份失败: {e}")
+            return {}
+
+        valid_pairs = discussion_pairs & actor_pairs
+        repo_months: Dict[str, List[str]] = defaultdict(list)
+        for repo_name, month in valid_pairs:
+            repo_months[repo_name].append(month)
+
+        for repo_name in list(repo_months.keys()):
+            repo_months[repo_name] = sorted(set(repo_months[repo_name]))
+
+        return dict(repo_months)
+
+    def load_discussion_graph(self, repo_name: str, month: str) -> Optional[nx.MultiDiGraph]:
+        """从 Kuzu 加载指定仓库月份的 actor-discussion 图，重建为 MultiDiGraph。"""
+        if self.conn is None:
+            logger.error("Kuzu 连接不可用，无法加载 discussion 图")
+            return None
+
+        try:
+            query = """
+            MATCH (a:Actor)-[r:ActorToDiscussion]->(d:Discussion)
+            WHERE r.repo_name = $repo_name AND r.month = $month
+            RETURN a.id, a.actor_id, a.login,
+                   d.id, d.node_type, d.repo_id, d.number, d.title, d.state,
+                   d.creator_id, d.creator_login, d.comment_count, d.participants_count, d.created_at,
+                   r.id, r.edge_type, r.created_at, r.comment_body
+            """
+            result = self.conn.execute(query, {
+                "repo_name": repo_name,
+                "month": month,
+            })
+
+            graph = nx.MultiDiGraph()
+            edges_list = []
+            while result.has_next():
+                (
+                    actor_id,
+                    actor_actor_id,
+                    actor_login,
+                    discussion_id,
+                    discussion_type,
+                    discussion_repo_id,
+                    discussion_number,
+                    discussion_title,
+                    discussion_state,
+                    discussion_creator_id,
+                    discussion_creator_login,
+                    discussion_comment_count,
+                    discussion_participants_count,
+                    discussion_created_at,
+                    rel_id,
+                    edge_type,
+                    edge_created_at,
+                    comment_body,
+                ) = result.get_next()
+
+                edges_list.append((
+                    str(actor_id),
+                    str(actor_actor_id) if actor_actor_id else "",
+                    str(actor_login) if actor_login else "",
+                    str(discussion_id),
+                    str(discussion_type) if discussion_type else "",
+                    str(discussion_repo_id) if discussion_repo_id else "",
+                    str(discussion_number) if discussion_number else "",
+                    str(discussion_title) if discussion_title else "",
+                    str(discussion_state) if discussion_state else "",
+                    str(discussion_creator_id) if discussion_creator_id else "",
+                    str(discussion_creator_login) if discussion_creator_login else "",
+                    str(discussion_comment_count) if discussion_comment_count else "",
+                    str(discussion_participants_count) if discussion_participants_count else "",
+                    str(discussion_created_at) if discussion_created_at else "",
+                    str(rel_id),
+                    str(edge_type) if edge_type else "",
+                    str(edge_created_at) if edge_created_at else "",
+                    str(comment_body) if comment_body else "",
+                ))
+
+            edges_list.sort(key=lambda e: (e[0], e[3], e[14]))
+
+            for (
+                actor_id,
+                actor_actor_id,
+                actor_login,
+                discussion_id,
+                discussion_type,
+                discussion_repo_id,
+                discussion_number,
+                discussion_title,
+                discussion_state,
+                discussion_creator_id,
+                discussion_creator_login,
+                discussion_comment_count,
+                discussion_participants_count,
+                discussion_created_at,
+                rel_id,
+                edge_type,
+                edge_created_at,
+                comment_body,
+            ) in edges_list:
+                graph.add_node(actor_id, actor_id=actor_actor_id, login=actor_login, node_type="Actor")
+                graph.add_node(
+                    discussion_id,
+                    node_type=discussion_type,
+                    repo_id=discussion_repo_id,
+                    number=discussion_number,
+                    title=discussion_title,
+                    state=discussion_state,
+                    creator_id=discussion_creator_id,
+                    creator_login=discussion_creator_login,
+                    comment_count=discussion_comment_count,
+                    participants_count=discussion_participants_count,
+                    created_at=discussion_created_at,
+                )
+                graph.add_edge(
+                    actor_id,
+                    discussion_id,
+                    key=rel_id,
+                    edge_type=edge_type,
+                    created_at=edge_created_at,
+                    comment_body=comment_body,
+                )
+
+            graph.graph["repo_name"] = repo_name
+            graph.graph["month"] = month
             return graph
         except Exception as e:
-            logger.warning(f"加载图失败: {graph_path}, 错误: {e}", exc_info=True)
+            logger.warning(f"从 Kuzu 加载 discussion 图失败: {repo_name}/{month}, 错误: {e}")
+            return None
+
+    def load_actor_actor_graph(self, repo_name: str, month: str) -> Optional[nx.MultiDiGraph]:
+        """从 Kuzu 加载指定仓库月份的 actor-actor 图，重建为 MultiDiGraph。"""
+        if self.conn is None:
+            logger.error("Kuzu 连接不可用，无法加载 actor-actor 图")
+            return None
+
+        try:
+            query = """
+            MATCH (a:Actor)-[r:ActorToActor]->(b:Actor)
+            WHERE r.repo_name = $repo_name AND r.month = $month
+            RETURN a.id, a.actor_id, a.login,
+                   b.id, b.actor_id, b.login,
+                   r.id, r.edge_type, r.created_at, r.comment_body, r.total_events
+            """
+            result = self.conn.execute(query, {
+                "repo_name": repo_name,
+                "month": month,
+            })
+
+            graph = nx.MultiDiGraph()
+            edges_list = []
+            total_events = None
+
+            while result.has_next():
+                (
+                    src_id,
+                    src_actor_id,
+                    src_login,
+                    dst_id,
+                    dst_actor_id,
+                    dst_login,
+                    rel_id,
+                    edge_type,
+                    created_at,
+                    comment_body,
+                    edge_total_events,
+                ) = result.get_next()
+
+                if total_events is None and edge_total_events:
+                    total_events = int(edge_total_events)
+
+                edges_list.append((
+                    str(src_id), str(src_actor_id) if src_actor_id else "", str(src_login) if src_login else "",
+                    str(dst_id), str(dst_actor_id) if dst_actor_id else "", str(dst_login) if dst_login else "",
+                    str(rel_id), str(edge_type) if edge_type else "", str(created_at) if created_at else "", str(comment_body) if comment_body else "",
+                ))
+
+            edges_list.sort(key=lambda e: (e[0], e[3], e[6]))
+
+            for (
+                src_id,
+                src_actor_id,
+                src_login,
+                dst_id,
+                dst_actor_id,
+                dst_login,
+                rel_id,
+                edge_type,
+                created_at,
+                comment_body,
+            ) in edges_list:
+                graph.add_node(src_id, actor_id=src_actor_id, login=src_login, node_type="Actor")
+                graph.add_node(dst_id, actor_id=dst_actor_id, login=dst_login, node_type="Actor")
+                graph.add_edge(
+                    src_id,
+                    dst_id,
+                    key=rel_id,
+                    edge_type=edge_type,
+                    created_at=created_at,
+                    comment_body=comment_body,
+                )
+
+            graph.graph["repo_name"] = repo_name
+            graph.graph["month"] = month
+            graph.graph["total_events"] = total_events if total_events is not None else 0
+            return graph
+        except Exception as e:
+            logger.warning(f"从 Kuzu 加载 actor-actor 图失败: {repo_name}/{month}, 错误: {e}")
             return None
     
     # def extract_sentiment_from_comments(
@@ -996,32 +1250,20 @@ class CommunityAtmosphereAnalyzer:
     
     def analyze_all_repos(self) -> Dict[str, Any]:
         """分析所有项目（支持断点续传：按月保存full_analysis，按项目更新summary）"""
-        # 从index.json加载所有项目
-        index_file = self.graphs_dir / "index.json"
-        print(f"正在读取索引文件: {index_file}", flush=True)
-        logger.info(f"正在读取索引文件: {index_file}")
-        logger.info(f"索引文件绝对路径: {index_file.resolve()}")
-        
-        if not index_file.exists():
-            print(f"错误: 索引文件不存在: {index_file}", flush=True)
-            logger.error(f"索引文件不存在: {index_file}")
-            logger.info("请先运行 monthly_graph_builder.py 构建图")
+        if self.conn is None:
+            logger.error("Kuzu 连接不可用，无法开始分析")
             return {}
-        
-        print(f"索引文件存在，开始加载（这可能需要几秒钟）...", flush=True)
-        logger.info(f"索引文件存在，开始加载...")
-        try:
-            with open(index_file, "r", encoding="utf-8") as f:
-                index = json.load(f)
-            print(f"索引文件加载成功", flush=True)
-            logger.info(f"索引文件加载成功")
-        except Exception as e:
-            print(f"错误: 加载索引文件失败: {e}", flush=True)
-            logger.error(f"加载索引文件失败: {e}", exc_info=True)
+
+        print("正在从 Kuzu 扫描项目与月份...", flush=True)
+        logger.info("正在从 Kuzu 扫描项目与月份...")
+        repo_months_map = self._scan_repo_months_from_kuzu()
+        if not repo_months_map:
+            print("错误: 未从 Kuzu 扫描到可分析的项目月份", flush=True)
+            logger.error("未从 Kuzu 扫描到可分析的项目月份")
             return {}
-        
-        total_repos = len(index)
-        print(f"索引文件加载完成，共 {total_repos} 个项目", flush=True)
+
+        total_repos = len(repo_months_map)
+        print(f"Kuzu 扫描完成，共 {total_repos} 个项目", flush=True)
         
         # 检查已存在的分析结果，实现断点续传
         # 注意：断点续传以“月份”为单位，而不是项目
@@ -1029,8 +1271,8 @@ class CommunityAtmosphereAnalyzer:
 
         # 计算哪些项目已经“完整完成”（其可分析月份全部在full_analysis中存在）
         completed_repos = set()
-        for repo_name, graph_types_data in index.items():
-            expected_months = set(self._get_expected_months_for_repo(graph_types_data))
+        for repo_name, months in repo_months_map.items():
+            expected_months = set(months)
             if not expected_months:
                 continue
             processed_months = self._get_processed_months_for_repo(repo_name, existing_results)
@@ -1042,7 +1284,7 @@ class CommunityAtmosphereAnalyzer:
             print(f"将跳过已完成项目，继续分析其余项目/月份...", flush=True)
             logger.info(f"发现已完成分析的项目: {len(completed_repos)} 个，将跳过")
 
-        remaining_repos = {k: v for k, v in index.items() if k not in completed_repos}
+        remaining_repos = {k: v for k, v in repo_months_map.items() if k not in completed_repos}
         remaining_count = len(remaining_repos)
         
         # Top30 过滤：仅当 use_top30=True 且成功加载了 top30_repos 时启用
@@ -1076,20 +1318,8 @@ class CommunityAtmosphereAnalyzer:
         
         all_results = existing_results.copy()  # 从已存在的结果开始
         
-        for repo_idx, (repo_name, graph_types_data) in enumerate(remaining_repos.items(), 1):
-            # 新格式: {repo: {graph_type: {month: path}}}
-            # 旧格式: {repo: {month: path}}
-            # 对于社区氛围分析：需要 actor-discussion + actor-actor 同月都存在
-            expected_months = self._get_expected_months_for_repo(graph_types_data)
-
-            first_value = next(iter(graph_types_data.values()), {})
-            if isinstance(first_value, dict) and not first_value.get("node_type"):
-                discussion_paths = graph_types_data.get("actor-discussion", {}) or {}
-                actor_actor_paths = graph_types_data.get("actor-actor", {}) or {}
-            else:
-                # 旧格式没有类型信息：无法满足“用actor-actor计算结构指标”的要求
-                logger.warning(f"{repo_name}: 索引为旧格式，无法同时获取actor-discussion与actor-actor，将跳过")
-                continue
+        for repo_idx, repo_name in enumerate(sorted(remaining_repos.keys()), 1):
+            expected_months = sorted(set(remaining_repos.get(repo_name, [])))
             
             # 显示实际进度（包括已完成的）
             actual_idx = len(completed_repos) + repo_idx
@@ -1122,23 +1352,15 @@ class CommunityAtmosphereAnalyzer:
                     skipped_months += 1
                     continue
 
-                discussion_path = discussion_paths.get(month)
-                actor_actor_path = actor_actor_paths.get(month)
-                if not discussion_path or not actor_actor_path:
-                    logger.warning(f"  [{month_idx}/{total_months}] 月份 {month} 缺少必要图文件，跳过 (discussion={bool(discussion_path)}, actor-actor={bool(actor_actor_path)})")
-                    continue
-
                 months_remaining = total_months - month_idx
                 month_progress_pct = month_idx / total_months * 100 if total_months > 0 else 0
                 print(f"  📅 月份进度: [{month_idx}/{total_months}] ({month_progress_pct:.0f}%) - {month} | 剩余 {months_remaining} 个月", flush=True)
                 logger.info(f"  [{month_idx}/{total_months}] ({month_progress_pct:.0f}%) 处理月份: {month}, 剩余 {months_remaining} 个月")
-                logger.info(f"  [{month_idx}/{total_months}] discussion图路径: {discussion_path}")
-                logger.info(f"  [{month_idx}/{total_months}] actor-actor图路径: {actor_actor_path}")
 
-                print(f"     ├─ 正在加载 discussion 图...", flush=True)
-                discussion_graph = self.load_graph(discussion_path)
-                print(f"     ├─ 正在加载 actor-actor 图...", flush=True)
-                actor_graph = self.load_graph(actor_actor_path)
+                print(f"     ├─ 正在从 Kuzu 加载 discussion 图...", flush=True)
+                discussion_graph = self.load_discussion_graph(repo_name, month)
+                print(f"     ├─ 正在从 Kuzu 加载 actor-actor 图...", flush=True)
+                actor_graph = self.load_actor_actor_graph(repo_name, month)
 
                 if discussion_graph is None or actor_graph is None:
                     logger.warning(f"  [{month_idx}/{total_months}] 图加载失败，跳过: {repo_name} {month}")
@@ -1282,11 +1504,17 @@ class CommunityAtmosphereAnalyzer:
                     expected_months_set = set(expected_months)
                     if expected_months_set and expected_months_set.issubset(current_processed_months):
                         try:
-                            self.save_summary(all_results, index)
+                            self.save_summary(all_results, repo_months_map)
                             print(f"  ✓ summary 已更新（项目 {repo_name} LLM 评分完成）", flush=True)
                             logger.info(f"  summary 已更新（项目 {repo_name} LLM 评分完成）")
                         except Exception as e:
                             logger.warning(f"  更新 summary 失败: {e}")
+
+            # 若该项目本轮没有触发 LLM 更新，但已完整处理，也刷新一次 summary
+            try:
+                self.save_summary(all_results, repo_months_map)
+            except Exception as e:
+                logger.warning(f"  刷新 summary 失败: {e}")
         
         # 最终汇总
         print(f"\n{'═' * 60}", flush=True)
@@ -1327,17 +1555,17 @@ class CommunityAtmosphereAnalyzer:
             json.dump(results, f, indent=2, ensure_ascii=False)
         logger.info(f"full_analysis已保存: {full_result_file} (共 {len(results)} 个项目)")
 
-    def save_summary(self, results: Dict[str, Any], index: Dict[str, Any]):
+    def save_summary(self, results: Dict[str, Any], repo_months_map: Dict[str, List[str]]):
         """
         写入 summary.json（按项目完成时调用）。
         仅包含“完成全部可分析月份”的项目。
         """
         summary = []
         for repo_name, repo_result in results.items():
-            graph_types_data = index.get(repo_name)
-            if not graph_types_data:
+            expected_months_list = repo_months_map.get(repo_name)
+            if not expected_months_list:
                 continue
-            expected_months = set(self._get_expected_months_for_repo(graph_types_data))
+            expected_months = set(expected_months_list)
             if not expected_months:
                 continue
             processed_months = self._get_processed_months_for_repo(repo_name, results)
@@ -1376,12 +1604,10 @@ class CommunityAtmosphereAnalyzer:
         # 最终落盘一次 full_analysis，并根据最终状态刷新 summary
         if results:
             self.save_full_analysis(results)
-            # 重新加载index并刷新summary（确保最终完整）
-            index_file = self.graphs_dir / "index.json"
+            # 重新扫描 Kuzu 并刷新 summary（确保最终完整）
             try:
-                with open(index_file, "r", encoding="utf-8") as f:
-                    index = json.load(f)
-                self.save_summary(results, index)
+                repo_months_map = self._scan_repo_months_from_kuzu()
+                self.save_summary(results, repo_months_map)
             except Exception as e:
                 logger.warning(f"最终刷新summary失败: {e}")
         
@@ -1421,6 +1647,12 @@ if __name__ == "__main__":
         help="输出目录"
     )
     parser.add_argument(
+        "--db-path",
+        type=str,
+        default="output/kuzu_db.kuzu",
+        help="Kuzu 数据库文件路径"
+    )
+    parser.add_argument(
         "--top30",
         action="store_true",
         default=False,
@@ -1431,11 +1663,13 @@ if __name__ == "__main__":
     
     print(f"图目录: {args.graphs_dir}", flush=True)
     print(f"输出目录: {args.output_dir}", flush=True)
+    print(f"Kuzu库路径: {args.db_path}", flush=True)
     print(f"Top30 过滤: {'启用' if args.top30 else '禁用'}", flush=True)
     print("正在初始化分析器...", flush=True)
     
     analyzer = CommunityAtmosphereAnalyzer(
         graphs_dir=args.graphs_dir,
+        db_path=args.db_path,
         output_dir=args.output_dir,
         use_top30=args.top30,
     )
