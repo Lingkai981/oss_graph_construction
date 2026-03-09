@@ -30,7 +30,8 @@ Repo 流动图结构分析器
     python src/analysis/repo_flow_analyzer.py \
         --flow-dir output/repo-flow-graphs \
         --output-dir output/repo-flow-analysis \
-        --top-n 20
+        --top-n 20 \
+        --health-rank-file comprehensive_rank.json
 """
 
 from __future__ import annotations
@@ -74,6 +75,147 @@ def change_rate(values: List[float]) -> float:
     early = sum(values[:w]) / w
     recent = sum(values[-w:]) / w
     return safe_div(recent - early, early)
+
+
+
+# ==================== 肯德尔等级相关系数 ====================
+
+def kendall_tau_b(x_ranks: List[float], y_ranks: List[float]) -> float:
+    """
+    Kendall tau-b，处理并列值。
+    tau-b = (C - D) / sqrt((C+D+T_x)*(C+D+T_y))
+    C = 一致对，D = 不一致对，T_x/T_y = 仅在一侧并列的对数。
+    tau-b in [-1, 1]；O(n^2)，49 个样本完全够用。
+    """
+    n = len(x_ranks)
+    if n != len(y_ranks) or n < 2:
+        return float("nan")
+    C = D = T_x = T_y = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = x_ranks[i] - x_ranks[j]
+            dy = y_ranks[i] - y_ranks[j]
+            prod = dx * dy
+            if prod > 0:
+                C += 1
+            elif prod < 0:
+                D += 1
+            else:
+                if dx == 0 and dy != 0:
+                    T_x += 1
+                elif dy == 0 and dx != 0:
+                    T_y += 1
+    denom = math.sqrt((C + D + T_x) * (C + D + T_y))
+    return float("nan") if denom == 0 else (C - D) / denom
+
+
+def compute_kendall_correlations(
+    aggregated: Dict[str, Any],
+    health_ranks: Dict[str, int],
+) -> Dict[str, Any]:
+    """
+    对每个流动图指标的均值排名，与综合健康排名计算 Kendall tau-b。
+
+    仅在 aggregated 与 health_ranks 的交集 repo 上计算。
+    指标排名：均值降序，rank=1 最高，并列取平均名次。
+    健康排名：health_ranks[repo] = rank_number（rank=1 最健康）。
+    tau > 0 表示该指标与健康度正相关。
+    """
+    common_repos = sorted(set(aggregated.keys()) & set(health_ranks.keys()))
+    n = len(common_repos)
+    result: Dict[str, Any] = {
+        "overlap_count": n,
+        "overlap_repos": common_repos,
+        "metrics": {},
+    }
+    if n < 3:
+        return result
+
+    metrics_cfg = [
+        ("pagerank",     "mean", True,  "PageRank 均值"),
+        ("hits_auth",    "mean", True,  "HITS Authority"),
+        ("hits_hub",     "mean", True,  "HITS Hub"),
+        ("net_flow",     "mean", True,  "净流量均值"),
+        ("betweenness",  "mean", True,  "介数中心性"),
+        ("weighted_in",  "mean", True,  "加权入度均值"),
+        ("weighted_out", "mean", False, "加权出度均值"),
+    ]
+
+    health_rank_vec = [health_ranks[r] for r in common_repos]
+
+    for metric_key, sub_key, higher_better, label in metrics_cfg:
+        values = {
+            repo: aggregated[repo][metric_key][sub_key]
+            for repo in common_repos
+            if metric_key in aggregated.get(repo, {})
+        }
+        if len(values) < 3:
+            continue
+
+        # 均值降序排列，并列取平均名次
+        sorted_by_val = sorted(values.items(), key=lambda x: x[1], reverse=True)
+        flow_rank: Dict[str, float] = {}
+        i = 0
+        while i < len(sorted_by_val):
+            j = i
+            while j + 1 < len(sorted_by_val) and sorted_by_val[j+1][1] == sorted_by_val[i][1]:
+                j += 1
+            avg_rank = (i + j) / 2 + 1
+            for k in range(i, j + 1):
+                flow_rank[sorted_by_val[k][0]] = avg_rank
+            i = j + 1
+
+        flow_rank_vec = [flow_rank[r] for r in common_repos]
+        tau = kendall_tau_b(flow_rank_vec, health_rank_vec)
+
+        # Spearman ρ（直接用排名向量，不重新排序，因为 flow_rank 已是排名）
+        n_c = len(common_repos)
+        mean_x = sum(flow_rank_vec) / n_c
+        mean_y = sum(health_rank_vec) / n_c
+        num_s = sum((flow_rank_vec[i] - mean_x) * (health_rank_vec[i] - mean_y) for i in range(n_c))
+        den_s = math.sqrt(
+            sum((v - mean_x) ** 2 for v in flow_rank_vec) *
+            sum((v - mean_y) ** 2 for v in health_rank_vec)
+        )
+        spearman = num_s / den_s if den_s != 0 else float("nan")
+
+        # 取平均（任一为 nan 时退化为另一个）
+        if math.isnan(tau) and math.isnan(spearman):
+            combined = float("nan")
+        elif math.isnan(tau):
+            combined = spearman
+        elif math.isnan(spearman):
+            combined = tau
+        else:
+            combined = (tau + spearman) / 2
+
+        if math.isnan(combined):          interp = "无法计算"
+        elif combined >= 0.5:             interp = "强正相关"
+        elif combined >= 0.3:             interp = "中等正相关"
+        elif combined >= 0.1:             interp = "弱正相关"
+        elif combined >= -0.1:            interp = "几乎无相关"
+        elif combined >= -0.3:            interp = "弱负相关"
+        elif combined >= -0.5:            interp = "中等负相关"
+        else:                        interp = "强负相关"
+
+        result["metrics"][metric_key] = {
+            "label":          label,
+            "tau":            round(tau, 4),
+            "spearman":       round(spearman, 4) if not math.isnan(spearman) else None,
+            "combined":       round(combined, 4) if not math.isnan(combined) else None,
+            "interpretation": interp,
+            "higher_better":  higher_better,
+            "ranking_table": [
+                {
+                    "repo":         r,
+                    "flow_rank":    flow_rank[r],
+                    "metric_value": round(values[r], 6),
+                    "health_rank":  health_ranks[r],
+                }
+                for r in common_repos
+            ],
+        }
+    return result
 
 
 # ==================== 图加载 ====================
@@ -363,6 +505,7 @@ def generate_html_report(
     community_result: Dict[str, Any],
     output_path: Path,
     top_n: int = 20,
+    kendall_result: Dict[str, Any] = None,
 ) -> None:
     """生成自包含的 HTML 交互式报告（内嵌 Chart.js）"""
 
@@ -485,6 +628,102 @@ def generate_html_report(
           <td>{gs['weakly_connected_components']}</td>
           <td>{gs['strongly_connected_components']}</td>
         </tr>"""
+
+    # ── Kendall Section 09 rendering ─────────────────────────────────────
+    k = kendall_result or {}
+    k_metrics = k.get("metrics", {})
+    k_overlap  = k.get("overlap_count", 0)
+
+    tau_color_map = {
+        "强正相关":   "#34d399", "中等正相关": "#86efac",
+        "弱正相关":   "#94a3b8", "几乎无相关": "#64748b",
+        "弱负相关":   "#fca5a5", "中等负相关": "#f87171",
+        "强负相关":   "#ef4444", "无法计算":   "#475569",
+    }
+
+    if k_metrics:
+        # Summary stat cards
+        summary_cards_html = ""
+        for mk, mv in k_metrics.items():
+            tau_val = mv["combined"]
+            interp  = mv["interpretation"]
+            color   = tau_color_map.get(interp, "#94a3b8")
+            sign    = "+" if tau_val > 0 else ""
+            summary_cards_html += (
+                f'<div class="stat-card" style="border-color:{color}44">'
+                f'<div class="stat-label">{mv["label"]}</div>'
+                f'<div class="stat-value" style="color:{color};font-size:22px">{sign}{tau_val:.4f}</div>'
+                f'<div class="stat-sub" style="color:{color}">{interp}</div>'
+                f'</div>'
+            )
+
+        # Per-metric detail tables as tabs
+        tab_btns_html  = ""
+        tab_panels_html = ""
+        for mi, (mk, mv) in enumerate(k_metrics.items()):
+            active_cls = "active" if mi == 0 else ""
+            pid = "ktab-" + mk
+            tab_btns_html += (
+                f'<button class="tab-btn {active_cls}"'
+                f' onclick="switchTab(this,\'{pid}\')">'
+                f'{mv["label"]}</button>'
+            )
+            rows_html = ""
+            for row in sorted(mv["ranking_table"], key=lambda x: x["flow_rank"]):
+                diff = row["health_rank"] - row["flow_rank"]
+                diff_str   = f"+{diff:.0f}" if diff > 0 else f"{diff:.0f}"
+                diff_color = "#f87171" if diff > 3 else ("#34d399" if diff < -3 else "#94a3b8")
+                rows_html += (
+                    f'<tr>'
+                    f'<td class="rank">#{row["flow_rank"]:.0f}</td>'
+                    f'<td class="repo-name">{row["repo"]}</td>'
+                    f'<td class="metric-val">{row["metric_value"]:.4f}</td>'
+                    f'<td class="rank">#{row["health_rank"]}</td>'
+                    f'<td class="metric-val" style="color:{diff_color}">{diff_str}</td>'
+                    f'</tr>'
+                )
+            tab_panels_html += (
+                f'<div id="{pid}" class="tab-panel {active_cls}">'
+                f'<div class="card">'
+                f'<div class="card-title">{mv["label"]} vs 健康度排名对照（共 {len(mv["ranking_table"])} 个项目）</div>'
+                f'<div class="table-wrap"><table>'
+                f'<thead><tr><th>流动图排名</th><th>Repo</th><th>指标值</th><th>健康度排名</th><th>名次差</th></tr></thead>'
+                f'<tbody>{rows_html}</tbody>'
+                f'</table></div></div></div>'
+            )
+
+        kendall_html_block = (
+            f'<div class="stat-card" style="margin-bottom:20px;border-color:#3b82f644">'
+            f'<div class="stat-label">参与计算的仓库数</div>'
+            f'<div class="stat-value">{k_overlap}</div>'
+            f'<div class="stat-sub">同时出现在流动图与综合健康排名中的仓库</div>'
+            f'</div>'
+            f'<div class="grid-4" style="margin-bottom:24px">{summary_cards_html}</div>'
+            f'<div class="card" style="margin-bottom:24px">'
+            f'<div class="card-title">各指标 Kendall τ-b 一览（水平条形图）</div>'
+            f'<div class="chart-wrap"><canvas id="kendallChart" style="max-height:280px"></canvas></div>'
+            f'</div>'
+            f'<div class="tabs">{tab_btns_html}</div>'
+            f'{tab_panels_html}'
+        )
+
+        k_labels  = [v["label"]          for v in k_metrics.values()]
+        k_values  = [v["combined"]             for v in k_metrics.values()]
+        k_interps = [v["interpretation"]  for v in k_metrics.values()]
+        kendall_chart_json = json.dumps({
+            "labels": k_labels, "values": k_values, "interps": k_interps,
+        })
+    else:
+        kendall_html_block = (
+            '<div class="card">'
+            '<div class="card-title">未提供综合健康排名文件</div>'
+            '<p style="color:var(--muted);padding:16px">'
+            '请通过 <code>--health-rank-file</code> 传入 <code>comprehensive_rank.json</code>，'
+            '脚本将自动计算 Kendall τ-b 并在此处展示结果。'
+            '</p></div>'
+        )
+        kendall_chart_json = "null"
+
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -784,6 +1023,7 @@ def generate_html_report(
   <a href="#trends">趋势分析</a>
   <a href="#community">社区检测</a>
   <a href="#timeline">图结构时序</a>
+  <a href="#kendall">健康度相关</a>
 </nav>
 
 <div class="container">
@@ -1013,6 +1253,22 @@ def generate_html_report(
   </div>
 </section>
 
+<hr class="divider">
+
+<!-- ════════════════ 9. KENDALL ════════════════ -->
+<section id="kendall">
+  <div class="section-title">Section 09</div>
+  <div class="section-heading">健康度相关性 — Kendall τ-b</div>
+  <div class="section-desc">
+    将本报告中每个指标的排名与 <code>comprehensive_rank.json</code> 中的项目健康度综合排名
+    计算 <strong>Kendall τ-b 等级相关系数</strong>（仅计算同时出现在两个数据集中的仓库）。
+    τ > 0 表示该指标排名越高的仓库，健康度得分也越高；τ &lt; 0 则相反。
+    τ-b 范围 [−1, 1]：|τ| ≥ 0.3 视为有意义的相关，|τ| ≥ 0.5 视为强相关。
+  </div>
+  {kendall_html_block}
+</section>
+
+
 </div><!-- /container -->
 
 <footer>
@@ -1197,6 +1453,48 @@ new Chart(document.getElementById('densityChart'), {{
   }}
 }});
 
+
+// ── Kendall τ-b 条形图 ────────────────────────────────
+const kendallData = {kendall_chart_json};
+if (kendallData && kendallData.labels && document.getElementById('kendallChart')) {{
+  const kendallColors = kendallData.values.map(v =>
+    v >= 0.3 ? '#34d399' : v >= 0.1 ? '#86efac' : v >= -0.1 ? '#94a3b8' : v >= -0.3 ? '#fca5a5' : '#f87171'
+  );
+  new Chart(document.getElementById('kendallChart'), {{
+    type: 'bar',
+    data: {{
+      labels: kendallData.labels,
+      datasets: [{{
+        label: 'Kendall τ-b',
+        data: kendallData.values,
+        backgroundColor: kendallColors,
+        borderColor: kendallColors,
+        borderWidth: 1,
+      }}]
+    }},
+    options: {{
+      indexAxis: 'y',
+      responsive: true,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{
+          callbacks: {{
+            afterLabel: ctx => kendallData.interps[ctx.dataIndex]
+          }}
+        }}
+      }},
+      scales: {{
+        x: {{
+          min: -1, max: 1,
+          grid: {{ color: '#1e2d45' }},
+          title: {{ display: true, text: 'Kendall τ-b' }}
+        }},
+        y: {{ grid: {{ color: '#1e2d45' }} }}
+      }}
+    }}
+  }});
+}}
+
 // ── Tab 切换 ──────────────────────────────────────
 function switchTab(btn, panelId) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1232,6 +1530,7 @@ def run_analysis(
     flow_dir: Path,
     output_dir: Path,
     top_n: int = 20,
+    health_rank_file: Optional[Path] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir = output_dir / "metrics"
@@ -1293,7 +1592,39 @@ def run_analysis(
         json.dump(aggregated, f, indent=2, ensure_ascii=False)
     print(f"[analyze] 聚合数据已保存: {aggregated_path}", flush=True)
 
-    # 5. 社区检测
+    # 5. Kendall 相关系数（可选）
+    kendall_result: Dict[str, Any] = {}
+    if health_rank_file is not None and health_rank_file.exists():
+        try:
+            with open(health_rank_file, encoding="utf-8") as f:
+                health_data = json.load(f)
+            # 支持两种格式：list of {project, rank} 或 {project: rank}
+            if isinstance(health_data, list):
+                health_ranks = {item["project"]: item["rank"] for item in health_data}
+            else:
+                health_ranks = {k: int(v) for k, v in health_data.items()}
+            print(f"[analyze] 加载健康度排名: {len(health_ranks)} 个项目", flush=True)
+            kendall_result = compute_kendall_correlations(aggregated, health_ranks)
+            kendall_path = output_dir / "kendall_correlations.json"
+            with open(kendall_path, "w", encoding="utf-8") as f:
+                json.dump(kendall_result, f, indent=2, ensure_ascii=False)
+            print(f"[analyze] Kendall 相关系数已保存: {kendall_path}", flush=True)
+            n_common = kendall_result.get("overlap_count", 0)
+            print(f"[analyze] 交集仓库数: {n_common}", flush=True)
+            missing = sorted(set(health_ranks.keys()) - set(aggregated.keys()))
+            if missing:
+                print(f"[analyze] 以下 {len(missing)} 个健康排名项目未出现在流动图中:", flush=True)
+                for r in missing:
+                    print(f"[analyze]   · {r}", flush=True)
+            for mk, mv in kendall_result.get("metrics", {}).items():
+                print(f"[analyze]   {mv['label']:20s}: τ-b = {mv['combined']:+.4f}  ({mv['interpretation']})", flush=True)
+        except Exception as e:
+            print(f"[analyze] 警告: 加载健康度排名失败: {e}", flush=True)
+    else:
+        if health_rank_file is not None:
+            print(f"[analyze] 警告: 健康度排名文件不存在: {health_rank_file}", flush=True)
+
+    # 6. 社区检测
     print("[analyze] 执行社区检测...", flush=True)
     community_result = detect_communities(flow_dir, index)
     community_path = output_dir / "communities.json"
@@ -1311,6 +1642,7 @@ def run_analysis(
         community_result=community_result,
         output_path=report_path,
         top_n=top_n,
+        kendall_result=kendall_result,
     )
 
     print(f"\n[analyze] 分析完成！输出目录: {output_dir}", flush=True)
@@ -1318,6 +1650,8 @@ def run_analysis(
     print(f"  · 摘要:       {summary_path}", flush=True)
     print(f"  · 聚合数据:   {aggregated_path}", flush=True)
     print(f"  · 社区:       {community_path}", flush=True)
+    if kendall_result:
+        print(f"  · Kendall 相关系数: {output_dir}/kendall_correlations.json", flush=True)
     print(f"  · HTML 报告:  {report_path}", flush=True)
 
 
@@ -1346,6 +1680,16 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="各排名榜单展示的最大条目数",
     )
+    parser.add_argument(
+        "--health-rank-file",
+        type=Path,
+        default=None,
+        help=(
+            "综合健康排名 JSON 文件路径，例如 comprehensive_rank.json。"
+            "格式：list of {project, rank} 或 dict {project: rank}。"
+            "提供后将计算 Kendall tau-b 相关系数并在报告 Section 09 展示。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1358,6 +1702,7 @@ def main() -> None:
         flow_dir=args.flow_dir,
         output_dir=args.output_dir,
         top_n=args.top_n,
+        health_rank_file=args.health_rank_file,
     )
 
 
