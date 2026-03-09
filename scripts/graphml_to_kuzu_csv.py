@@ -12,7 +12,7 @@ Schema 采用“单表 + edge_type 字段”策略。
 
 用法（在仓库根目录执行）：
         python scripts/graphml_to_kuzu_csv.py \
-                --input-dir output/monthly-graphs2 \
+                --input-dir output/monthly-graphs \
                 --output-dir output/kuzu_csv
 
 脚本不虚构字段；缺失值保持为空。

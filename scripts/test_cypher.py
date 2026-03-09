@@ -1,7 +1,8 @@
 # 测试 Cypher 查询
 import kuzu
 
-db = kuzu.Database(r"output\\kuzu_db.kuzu")
+# db = kuzu.Database(r"output\\kuzu_db")
+db = kuzu.Database(r"output/kuzu_db")
 conn = kuzu.Connection(db)
 
 # 多条查询
@@ -18,3 +19,7 @@ for query in queries:
     result = conn.execute(query)
     while result.has_next():
         print(result.get_next())
+
+res = conn.execute("CALL show_tables() RETURN *;")
+while res.has_next():
+    print(res.get_next())

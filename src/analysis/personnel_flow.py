@@ -79,40 +79,53 @@ class PersonnelFlowAnalyzer:
         input_path: str = "output/burnout-analysis/full_analysis.json",
         output_dir: str = "output/personnel-flow/",
         scope: str = "core",
-        graphs_dir: Optional[str] = None,
+        kuzu_db_path: Optional[str] = None,  # 替代 graphs_dir
     ):
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir)
-        self.scope = scope  # "core" | "all"
-        self.graphs_dir = Path(graphs_dir) if graphs_dir else None
+        self.scope = scope
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Kuzu 连接（scope=all 时必须）
+        self.kuzu_db_path = kuzu_db_path
+        self._db = None
+        self._conn = None
+        if kuzu_db_path:
+            import kuzu
+            self._db = kuzu.Database(str(kuzu_db_path))
+            self._conn = kuzu.Connection(self._db)
 
     def _scope_label(self) -> str:
         return "全部贡献者" if self.scope == "all" else "核心成员"
 
-    def _load_graph(self, graph_path: str) -> Optional[nx.MultiDiGraph]:
-        """加载图（兼容 Windows 路径）"""
-        try:
-            normalized_path = Path(str(graph_path).replace("\\", "/"))
-            g = nx.read_graphml(normalized_path)
-            if isinstance(g, nx.MultiDiGraph):
-                return g
-            if isinstance(g, nx.DiGraph):
-                mg = nx.MultiDiGraph()
-                mg.add_nodes_from(g.nodes(data=True))
-                mg.add_edges_from(g.edges(data=True))
-                mg.graph.update(g.graph)
-                return mg
-            if isinstance(g, (nx.Graph, nx.MultiGraph)):
-                dg = g.to_directed()
-                mg = nx.MultiDiGraph()
-                mg.add_nodes_from(dg.nodes(data=True))
-                mg.add_edges_from(dg.edges(data=True))
-                mg.graph.update(dg.graph)
-                return mg
+    def _load_graph_from_kuzu(self, repo_name: str, month: str) -> Optional[nx.MultiDiGraph]:
+        """从 Kuzu 查询 Actor-Actor 边，重建 nx.MultiDiGraph（与 newcomer_analyzer v2 一致）"""
+        if self._conn is None:
+            logger.warning("Kuzu 连接未初始化")
             return None
+        query = f"""
+        MATCH (a:Actor)-[r:ActorToActor]->(b:Actor)
+        WHERE r.repo_name = "{repo_name}" AND r.month = "{month}"
+        RETURN a.id, a.actor_id, a.login, b.id, b.actor_id, b.login
+        """
+        try:
+            result = self._conn.execute(query)
+            G = nx.MultiDiGraph()
+            while result.has_next():
+                row = result.get_next()
+                a_id, a_actor_id, a_login, b_id, b_actor_id, b_login = row
+                if not G.has_node(str(a_id)):
+                    G.add_node(str(a_id),
+                            node_type="Actor",
+                            login=str(a_login) if a_login else str(a_id))
+                if not G.has_node(str(b_id)):
+                    G.add_node(str(b_id),
+                            node_type="Actor",
+                            login=str(b_login) if b_login else str(b_id))
+                G.add_edge(str(a_id), str(b_id))
+            return G if G.number_of_nodes() > 0 else None
         except Exception as e:
-            logger.warning(f"加载图失败: {graph_path}, 错误: {e}")
+            logger.warning(f"Kuzu 加载图失败: {repo_name} {month}, 错误: {e}")
             return None
 
     def _load_burnout_data(self) -> Dict[str, Any]:
@@ -126,49 +139,57 @@ class PersonnelFlowAnalyzer:
         self,
         repo_names: List[str],
     ) -> Dict[str, Any]:
-        """从月度图加载所有节点，构建与 burnout 格式兼容的数据（core_actors = 全部贡献者）"""
-        if not self.graphs_dir or not self.graphs_dir.exists():
-            raise FileNotFoundError(f"图目录不存在: {self.graphs_dir}，请指定 --graphs-dir")
-        index_file = self.graphs_dir / "index.json"
-        if not index_file.exists():
-            raise FileNotFoundError(f"索引不存在: {index_file}")
-        with open(index_file, "r", encoding="utf-8") as f:
-            index = json.load(f)
+        """从 Kuzu 查询各 repo 所有月份，构建与 burnout 格式兼容的数据"""
+        if self._conn is None:
+            raise ValueError("scope=all 时需初始化 Kuzu 连接（--kuzu-db）")
 
-        result = {}
+        # 1. 查询所有 (repo_name, month) 组合
+        query = """
+        MATCH ()-[r:ActorToActor]->()
+        RETURN DISTINCT r.repo_name, r.month
+        ORDER BY r.repo_name, r.month
+        """
+        repo_months: Dict[str, List[str]] = defaultdict(list)
+        try:
+            result = self._conn.execute(query)
+            while result.has_next():
+                row = result.get_next()
+                rname, month = str(row[0]), str(row[1])
+                if rname in repo_names:
+                    repo_months[rname].append(month)
+        except Exception as e:
+            raise RuntimeError(f"查询 repo/month 失败: {e}")
+
+        # 2. 按月加载图，构建 metrics 序列
+        result_data = {}
         for repo_name in repo_names:
-            graph_types = index.get(repo_name, {})
-            first_val = next(iter(graph_types.values()), {})
-            if isinstance(first_val, dict) and not first_val.get("node_type"):
-                months_data = graph_types.get("actor-actor", {})
-            else:
-                months_data = graph_types
-            if not months_data or not isinstance(months_data, dict):
+            months = sorted(repo_months.get(repo_name, []))
+            if not months:
                 continue
+            logger.info(f"  从 Kuzu 加载 {repo_name}（{len(months)} 个月）")
             metrics_series = []
-            for month, graph_path in sorted(months_data.items()):
-                graph = self._load_graph(graph_path)
+            for month in months:
+                graph = self._load_graph_from_kuzu(repo_name, month)
                 if graph is None:
                     continue
                 degrees = dict(graph.degree())
-                # 按度数降序，构建 (login, degree) 列表
                 actors = []
                 for node_id in graph.nodes():
                     login = graph.nodes[node_id].get("login", str(node_id))
                     degree = degrees.get(node_id, 0)
                     actors.append((login, degree))
-                actors.sort(key=lambda x: -x[1])
-                total_events = graph.graph.get("total_events", 0)
+                # actors.sort(key=lambda x: -x[1])
+                actors.sort(key=lambda x: (-x[1], x[0]))
                 metrics_series.append({
                     "month": month,
                     "repo_name": repo_name,
                     "unique_actors": len(actors),
-                    "total_events": total_events,
+                    "total_events": graph.number_of_edges(),
                     "core_actors": actors,
                 })
             if metrics_series:
-                result[repo_name] = {"metrics": metrics_series}
-        return result
+                result_data[repo_name] = {"metrics": metrics_series}
+        return result_data
 
     def _extract_core_per_month(
         self,
@@ -475,8 +496,8 @@ class PersonnelFlowAnalyzer:
         logger.info(f"人员流动分析（{scope_label}）...")
 
         if self.scope == "all":
-            if not self.graphs_dir:
-                raise ValueError("scope=all 时需指定 --graphs-dir")
+            if not self.kuzu_db_path:
+                raise ValueError("scope=all 时需指定 --kuzu-db")
             burnout_data = self._load_burnout_data()
             repo_names = list(burnout_data.keys())
             logger.info(f"从图加载 {len(repo_names)} 个 repo 的全部贡献者...")
@@ -1239,10 +1260,10 @@ def main():
         help="分析范围：core=核心成员，all=全部贡献者（需 --graphs-dir）",
     )
     parser.add_argument(
-        "--graphs-dir",
+        "--kuzu-db",
         type=str,
         default=None,
-        help="月度图目录（scope=all 时必填，需与 burnout 分析使用的图一致）",
+        help="Kuzu 数据库目录（scope=all 时必填）",
     )
     parser.add_argument(
         "--flow-months",
@@ -1256,14 +1277,14 @@ def main():
     if output_dir is None:
         output_dir = "output/personnel-flow-all/" if args.scope == "all" else "output/personnel-flow/"
 
-    if args.scope == "all" and not args.graphs_dir:
-        parser.error("scope=all 时必须指定 --graphs-dir")
+    if args.scope == "all" and not args.kuzu_db:
+        parser.error("scope=all 时必须指定 --kuzu-db")
 
     analyzer = PersonnelFlowAnalyzer(
         input_path=args.input,
         output_dir=output_dir,
         scope=args.scope,
-        graphs_dir=args.graphs_dir,
+        kuzu_db_path=args.kuzu_db,
     )
     analyzer.run(flow_months_after=args.flow_months)
 
