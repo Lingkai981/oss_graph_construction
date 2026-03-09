@@ -75,8 +75,12 @@ def compute_network_diameter(
     else:
         print(f"  图不连通（{num_components}个连通分量），正在计算最大连通分量的直径...", flush=True)
         # 图不连通，计算最大连通分量的直径
+        # 注意：若存在多个“同样大小”的最大连通分量，
+        # 直接 max(..., key=len) 会依赖节点插入顺序，
+        # 进而导致不同数据源（GraphML / Kuzu）出现轻微不一致。
+        # 这里增加确定性 tie-break，保证同一拓扑结构结果一致。
         connected_components = list(nx.connected_components(actor_graph))
-        largest_cc = max(connected_components, key=len)
+        largest_cc = _select_deterministic_largest_component(connected_components)
         subgraph = actor_graph.subgraph(largest_cc)
         
         if len(largest_cc) > 1:
@@ -99,6 +103,21 @@ def compute_network_diameter(
         "actor_graph_nodes": actor_graph.number_of_nodes(),
         "actor_graph_edges": actor_graph.number_of_edges(),
     }
+
+
+def _select_deterministic_largest_component(connected_components):
+    """从连通分量列表中确定性地选择“最大连通分量”。
+
+    规则：
+    1. 优先按分量大小（节点数）选择；
+    2. 若大小相同，按节点 ID 的字典序元组做 tie-break。
+
+    这样可以避免结果依赖图构建时的节点插入顺序。
+    """
+    return max(
+        connected_components,
+        key=lambda comp: (len(comp), tuple(sorted(str(node) for node in comp))),
+    )
 
 def _prepare_actor_graph(graph: nx.MultiDiGraph) -> nx.Graph:
     """

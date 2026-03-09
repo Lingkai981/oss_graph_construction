@@ -5,8 +5,8 @@
 #   ./scripts/analyze_burnout.sh
 #
 # 流程:
-#   1. 按月构建所有项目的 Actor-Actor 协作图
-#   2. 对每个项目运行倦怠分析算法
+#   1. 检查 Kuzu 数据库是否存在
+#   2. 对每个项目运行倦怠分析算法（从 Kuzu 查询）
 #   3. 输出分析报告和预警列表
 
 set -e
@@ -23,36 +23,21 @@ echo "=========================================="
 echo "维护者倦怠分析"
 echo "=========================================="
 
-# 检查数据是否存在
-if [ ! -d "data/filtered" ] || [ -z "$(ls -A data/filtered 2>/dev/null)" ]; then
-    echo "错误: 未找到过滤后的数据"
-    echo "请先运行数据收集脚本:"
-    echo "  ./scripts/collect_data.sh daily"
+# 检查 Kuzu 数据库
+if [ ! -f "output/kuzu_db.kuzu" ]; then
+    echo "错误: 未找到 Kuzu 数据库 output/kuzu_db.kuzu"
+    echo "请先准备 Kuzu 数据库（例如先执行 CSV 导入脚本）"
     exit 1
 fi
 
-# 统计数据
-FILE_COUNT=$(ls data/filtered/*-filtered.json 2>/dev/null | wc -l | tr -d ' ')
-echo "已找到 $FILE_COUNT 个数据文件"
-
-# Step 1: 构建月度图
+# Step 1: 运行倦怠分析
 echo ""
 echo "=========================================="
-echo "Step 1: 构建月度 Actor-Actor 协作图"
-echo "=========================================="
-
-python -m src.analysis.monthly_graph_builder \
-    --data-dir data/filtered/ \
-    --output-dir output/monthly-graphs/
-
-# Step 2: 运行倦怠分析
-echo ""
-echo "=========================================="
-echo "Step 2: 运行倦怠分析算法"
+echo "Step 1: 运行倦怠分析算法（Kuzu）"
 echo "=========================================="
 
 python -m src.analysis.burnout_analyzer \
-    --graphs-dir output/monthly-graphs/ \
+    --db-path output/kuzu_db.kuzu \
     --output-dir output/burnout-analysis/
 
 echo ""
@@ -61,7 +46,6 @@ echo "分析完成!"
 echo "=========================================="
 echo ""
 echo "输出文件:"
-echo "  - output/monthly-graphs/          月度图数据"
 echo "  - output/burnout-analysis/        分析结果"
 echo "    - summary.json                  项目风险摘要（按风险排序）"
 echo "    - all_alerts.json               所有预警列表"

@@ -42,6 +42,7 @@ class PipelineContext:
     root_dir: Path
     data_dir: Path
     graphs_dir: Path
+    kuzu_db_path: Path
     output_dir: Path
     burnout_dir: Path
     newcomer_dir: Path
@@ -164,8 +165,10 @@ def run_burnout_analysis(ctx: PipelineContext) -> None:
     from src.analysis.burnout_analyzer import BurnoutAnalyzer
 
     ctx.burnout_dir.mkdir(parents=True, exist_ok=True)
+    ensure_exists(ctx.kuzu_db_path, "Kuzu 数据库文件（倦怠分析必需）")
     analyzer = BurnoutAnalyzer(
         graphs_dir=str(ctx.graphs_dir),
+        db_path=str(ctx.kuzu_db_path),
         output_dir=str(ctx.burnout_dir),
     )
     analyzer.run()
@@ -520,6 +523,7 @@ def resolve_paths(args: argparse.Namespace) -> PipelineContext:
     root_dir = Path(args.root_dir).resolve() if args.root_dir else Path(__file__).resolve().parent
     data_dir = Path(args.data_dir).resolve() if args.data_dir else guess_data_dir(root_dir)
     graphs_dir = Path(args.graphs_dir).resolve() if args.graphs_dir else (root_dir / "output" / "monthly-graphs").resolve()
+    kuzu_db_path = Path(args.kuzu_db_path).resolve() if args.kuzu_db_path else (root_dir / "output" / "kuzu_db.kuzu").resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else (root_dir / "output").resolve()
 
     burnout_dir = (output_dir / args.burnout_dir).resolve()
@@ -539,6 +543,7 @@ def resolve_paths(args: argparse.Namespace) -> PipelineContext:
         root_dir=root_dir,
         data_dir=data_dir,
         graphs_dir=graphs_dir,
+        kuzu_db_path=kuzu_db_path,
         output_dir=output_dir,
         burnout_dir=burnout_dir,
         newcomer_dir=newcomer_dir,
@@ -617,6 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root-dir", type=str, help="项目根目录（默认取脚本所在目录）")
     parser.add_argument("--data-dir", type=str, help="原始月度聚合数据目录，用于构图")
     parser.add_argument("--graphs-dir", type=str, help="月度图数据输出目录")
+    parser.add_argument("--kuzu-db-path", type=str, help="Kuzu 数据库文件路径（倦怠分析使用）")
     parser.add_argument("--output-dir", type=str, help="所有结果的根输出目录")
 
     parser.add_argument("--burnout-dir", type=str, default="burnout-analysis", help="倦怠分析输出子目录")
@@ -671,6 +677,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"  根目录:       {ctx.root_dir}")
     print(f"  数据源:       {ctx.data_dir}")
     print(f"  月度图:       {ctx.graphs_dir}")
+    print(f"  Kuzu库:       {ctx.kuzu_db_path}")
     print(f"  输出根:       {ctx.output_dir}")
     print(f"  倦怠目录:     {ctx.burnout_dir}")
     print(f"  新人目录:     {ctx.newcomer_dir}")
