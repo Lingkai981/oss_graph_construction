@@ -412,10 +412,35 @@ class NewcomerAnalyzer:
     # ---------- 核心成员识别（与 v4 完全相同） ----------
 
     def identify_core_members(self, graph: nx.MultiDiGraph) -> Tuple[List[str], List[int], List[str]]:
+        """
+        核心成员识别规则：
+
+        1. 对每个 Actor 节点计算两个结构指标：
+        - degree：节点度数，表示其连接活跃程度
+        - k-core number：节点所在 k-core 层级，表示其处于网络核心区的深度
+
+        2. 对两个指标做归一化后加权求综合分：
+        score = 0.6 * normalized_degree + 0.4 * normalized_kcore
+
+        3. 按 score 降序排序（若分数相同则按 node_id 升序）。
+
+        4. 依次选取排序靠前的成员作为 core，直到满足任一停止条件：
+        - 已覆盖全图总度数的 70%（累计 degree 贡献）
+        - core 数量达到总人数的 30%（至少按 3 计算上限）
+        - 当前候选分数低于全体平均分，且已经选出至少 3 名 core
+
+        5. 为避免极端情况，若最终 core 少于 2 人，则补齐排序前 2 名。
+
+        返回：
+        - core_node_ids：核心成员节点 ID
+        - core_actor_ids：核心成员 actor_id
+        - core_logins：核心成员 login
+        """
         if graph.number_of_nodes() == 0:
             return [], [], []
 
         degrees = dict(graph.degree())
+        # 获取degree列表
         if not degrees:
             return [], [], []
 
@@ -427,6 +452,7 @@ class NewcomerAnalyzer:
         try:
             undirected = graph.to_undirected()
             core_numbers = nx.core_number(undirected)
+            # K核分解，获取每个成员的k值列表
             max_k = max(core_numbers.values()) if core_numbers else 0
         except Exception:
             core_numbers = {n: 1 for n in graph.nodes()}
@@ -439,6 +465,7 @@ class NewcomerAnalyzer:
             degree_norm = deg / max(degree_max, 1)
             kcore_norm = kcore / max(max_k, 1)
             score = 0.6 * degree_norm + 0.4 * kcore_norm
+            # 得分加权求和
             actor_scores[node_id] = {"score": score, "degree": deg, "kcore": kcore}
 
         # sorted_actors = sorted(actor_scores.items(), key=lambda x: x[1]["score"], reverse=True)
@@ -462,6 +489,12 @@ class NewcomerAnalyzer:
                 or len(core_node_ids) >= max_core_count
                 or (sdata["score"] < avg_score and len(core_node_ids) >= 3)
             )
+            '''
+            选出尽可能少的成员满足以下规则
+            规则1: 合计贡献度数超过总度数的70%
+            规则2: 核心贡献者至少选取三个，且人数要大于总人数的30%
+            规则3: 核心贡献者的得分不应小于平均分
+            '''
             if should_stop:
                 continue
 
@@ -495,6 +528,18 @@ class NewcomerAnalyzer:
         repo_name: str,
         prepared_months: List[PreparedMonth],
     ) -> Tuple[List[NewcomerDistanceRecord], List[Dict[str, Any]]]:
+        """
+        新人成员判定规则：
+
+        - 维护 first_seen[node_id]，记录每个 Actor 节点第一次出现的月份。
+        - 按月份顺序扫描图中的 Actor 节点。
+        - 若某节点此前从未出现过，则将当前月记为其 first_seen_month，
+        并把该节点视为“本月 newcomer（新人）”。
+
+        注意：
+        这里的 newcomer 是“在分析时间窗口内首次出现的成员”，
+        不一定代表其在项目全历史中的绝对首次参与者。
+        """
         newcomer_records: List[NewcomerDistanceRecord] = []
         monthly_summary: List[Dict[str, Any]] = []
         first_seen: Dict[str, str] = {}
@@ -518,6 +563,7 @@ class NewcomerAnalyzer:
                     newcomer_actor_id = _parse_actor_id(attr.get("actor_id", 0))
 
                     core_targets = [c for c in core_node_ids if c != node_id]
+                    # 获取核心成员列表，排除该成员自己
                     total_core = len(core_targets)
 
                     if total_core == 0:
@@ -541,7 +587,7 @@ class NewcomerAnalyzer:
                     avg_len: Optional[float] = (
                         None if reachable_count == 0
                         else round(sum(reachable) / reachable_count, 4)
-                    )
+                    ) # 平均路径长度 = 总路径长度 / 可达核心节点数量
 
                     rec = NewcomerDistanceRecord(
                         repo_name=repo_name,
@@ -557,8 +603,7 @@ class NewcomerAnalyzer:
                     newcomers_this_month.append(rec)
 
             vals = [r.avg_shortest_path_to_core for r in newcomers_this_month if r.avg_shortest_path_to_core is not None]
-            month_avg = round(sum(vals) / len(vals), 4) if vals else None
-
+            month_avg = round(sum(vals) / len(vals), 4) if vals else None # 月度指标
             monthly_summary.append({
                 "repo_name": repo_name,
                 "month": month,
@@ -596,7 +641,7 @@ class NewcomerAnalyzer:
                 if str(attr.get("node_type", "Actor")) != "Actor":
                     continue
                 if node_id not in first_seen:
-                    first_seen[node_id] = month
+                    first_seen[node_id] = month # 每个成员第一次出现的月份
                 if node_id not in actor_info:
                     actor_info[node_id] = (
                         _parse_actor_id(attr.get("actor_id", 0)),
@@ -613,7 +658,7 @@ class NewcomerAnalyzer:
             if not seen_month:
                 continue
             actor_id, login = actor_info.get(node_id, (0, node_id))
-            months_to_core = _months_diff(seen_month, core_month)
+            months_to_core = _months_diff(seen_month, core_month) # 计算月份差
             records_all.append(PeripheryToCoreRecord(
                 repo_name=repo_name,
                 actor_node_id=node_id,
@@ -629,6 +674,7 @@ class NewcomerAnalyzer:
             r for r in records_all
             if not (r.first_seen_month == first_month and r.first_core_month == first_month)
         ]
+        # 排除掉最开始就是核心成员、或者最早出现时间是第一个月的这部分人，因为不知道具体成为核心成员或者具体加入项目是哪天，会对统计结果产生影响
 
         overall_avg = round(sum(r.months_to_core for r in records) / len(records), 4) if records else None
 
@@ -669,7 +715,7 @@ class NewcomerAnalyzer:
         total_actor_sum = 0
         total_unreach_all = 0
         total_unreach_any = 0
-
+        # 部分不可达和完全不可达
         for pm in prepared_months:
             graph = pm.graph
             month = pm.month
