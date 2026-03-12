@@ -5,7 +5,7 @@ Newcomer / Core-evolution analyzer (v4)
 1) 指标2（Periphery→Core）：排除“分析窗口第一个月就已经是核心成员”的 actor（避免 months_to_core=0 拉低均值）。
 2) 指标3（core reachability）：不可达比例的分母改为“当月所有成员数（Actor 总数）”，而不是非核心人数。
    - 分子仍然统计“非核心成员”到 core 的不可达情况（更符合‘外围与核心的断裂’信号，同时避免 core 自身稀释信号）
-3) 三层分析方向统一为：三个指标都是“越小越好”（increase_is_bad=True）。
+3) 两层分析：长期趋势(50%) + 稳定性惩罚(50%)，方向统一为：三个指标都是"越小越好"（increase_is_bad=True）。
    - 均值步长 / 晋核耗时 / 不可达比例：上升代表变差，评分应更低（或惩罚更高）
    - 这里我们输出的是“惩罚分/风险分”风格：越高表示越糟（用于排序），与 burnout 的用法一致
 
@@ -391,6 +391,9 @@ class NewcomerAnalyzer:
         """
         prepared: List[PreparedMonth] = []
         for month in sorted(month_to_graph_path.keys()):
+            # 过滤掉 2026-03（数据不完整）
+            if month == "2026-03":
+                continue
             path = month_to_graph_path[month]
             graph = self.load_graph(path)
             if graph is None or graph.number_of_nodes() == 0:

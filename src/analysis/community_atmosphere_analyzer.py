@@ -933,14 +933,31 @@ class CommunityAtmosphereAnalyzer:
             s_llm = calculate_time_series_component_score(llm_scores, is_positive_metric=True)
             logger.info(f"LLM 评分维度: 使用 {len(llm_scores)} 个月的数据进行三层分析，得分={s_llm:.2f}")
         else:
-            # 没有 LLM 评分数据：使用 0
-            s_llm = 0.0
-            # 如果 LLM 评分器可用，说明后续会进行评分，此时只是暂时无数据，使用 info 级别
-            # 如果 LLM 评分器不可用，说明确实无法评分，使用 warning 级别
-            if self.llm_scorer.is_available():
-                logger.info(f"LLM 评分维度: 暂无评分数据，使用占位值 0（后续将进行 LLM 评分）")
+            # 没有 LLM 评分数据：尝试使用 ToxiCR 毒性数据作为替代
+            toxicity_means = [getattr(m, 'toxicity_mean', 0.0) for m in metrics_series]
+            toxic_rates = [getattr(m, 'toxic_rate_0_5', 0.0) for m in metrics_series]
+            has_toxicity = any(t > 0 for t in toxicity_means)
+            
+            if has_toxicity:
+                # 有 ToxiCR 毒性数据：基于毒性指标计算替代评分
+                # 毒性越低越好 → 负向指标
+                # toxic_rate 是 0~1 之间的比例，转为 0~100 的评分
+                # 毒性率 0% → 100分, 5% → 50分, 10%+ → 0分
+                avg_toxic_rate = np.mean(toxic_rates) if toxic_rates else 0
+                s_llm = max(0.0, 100.0 - avg_toxic_rate * 2000)  # 5% toxic_rate → 0分
+                # 同时考虑毒性均值趋势（使用三层分析）
+                s_tox_trend = calculate_time_series_component_score(toxicity_means, is_positive_metric=False)
+                s_llm = s_llm * 0.5 + s_tox_trend * 0.5
+                logger.info(f"LLM 评分维度: 使用 ToxiCR 毒性数据替代, 毒性率={avg_toxic_rate:.4f}, "
+                           f"毒性趋势分={s_tox_trend:.2f}, 综合分={s_llm:.2f}")
             else:
-                logger.warning(f"LLM 评分维度: 无有效数据，使用占位值 0（LLM 评分器不可用）")
+                s_llm = 0.0
+                # 如果 LLM 评分器可用，说明后续会进行评分，此时只是暂时无数据，使用 info 级别
+                # 如果 LLM 评分器不可用，说明确实无法评分，使用 warning 级别
+                if self.llm_scorer.is_available():
+                    logger.info(f"LLM 评分维度: 暂无评分数据，使用占位值 0（后续将进行 LLM 评分）")
+                else:
+                    logger.warning(f"LLM 评分维度: 无有效数据，使用占位值 0（LLM 评分器不可用）")
         
         # ========================================
         # 维度 2：聚类系数 (30%)

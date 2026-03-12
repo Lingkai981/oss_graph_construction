@@ -515,12 +515,11 @@ class BurnoutAnalyzer:
         reverse: bool = False,
     ) -> Dict[str, Any]:
         """
-        计算单个维度的倦怠得分（三层分析）
+        计算单个维度的倦怠得分（两层分析）
         
         架构：
-        - 长期趋势 (40%): 线性回归斜率
-        - 近期状态 (40%): 最近3个月 vs 最早3个月
-        - 稳定性 (20%): 波动率惩罚
+        - 长期趋势 (50%): 对归一化序列做线性回归，斜率反映整个观测期的走向
+        - 稳定性惩罚 (50%): 月度环比变化率的标准差，波动越大扣分越多
         
         Args:
             reverse: 如果为 True，逻辑反转（用于流失率等：上升得高分，下降得低分）
@@ -530,7 +529,6 @@ class BurnoutAnalyzer:
             return {
                 "score": 0,
                 "long_term_trend": {"slope": 0, "score": 0},
-                "recent_state": {"early_avg": 0, "recent_avg": 0, "change": 0, "score": 0},
                 "stability": {"volatility": 0, "score": 0},
             }
         
@@ -538,39 +536,22 @@ class BurnoutAnalyzer:
         first_nonzero = next((v for v in values if v > 0), 1)
         normalized = [v / first_nonzero for v in values]
         
-        # ========== 1. 长期趋势 (40%) ==========
-        # 线性回归斜率
+        # ========== 1. 长期趋势 (50%) ==========
+        # 对归一化序列做线性回归，斜率反映整个观测期的走向
         slope = self._linear_regression_slope(normalized)
         # 默认逻辑：负斜率（下降）得高分；reverse=True 时：正斜率（上升）得高分
         if reverse:
-            trend_score = max(0, min(max_score * 0.4, slope * max_score * 4))
+            trend_score = max(0, min(max_score * 0.5, slope * max_score * 5))
         else:
-            trend_score = max(0, min(max_score * 0.4, -slope * max_score * 4))
+            trend_score = max(0, min(max_score * 0.5, -slope * max_score * 5))
         
-        # ========== 2. 近期状态 (40%) ==========
-        # 对比最近3个月和最早3个月的均值
-        window = min(3, n // 2) if n >= 4 else 1
-        early_avg = sum(values[:window]) / window
-        recent_avg = sum(values[-window:]) / window
-        
-        if early_avg > 0:
-            recent_change = (recent_avg - early_avg) / early_avg
-        else:
-            recent_change = 0
-        
-        # 默认逻辑：变化率 < 0（下降）得高分；reverse=True 时：变化率 > 0（上升）得高分
-        if reverse:
-            recent_score = max(0, min(max_score * 0.4, recent_change * max_score * 0.4))
-        else:
-            recent_score = max(0, min(max_score * 0.4, -recent_change * max_score * 0.4))
-        
-        # ========== 3. 稳定性惩罚 (20%) ==========
-        # 波动率 > 0.3 开始扣分
+        # ========== 2. 稳定性惩罚 (50%) ==========
+        # 月度环比变化率的标准差，波动越大扣分越多
         volatility = self._compute_volatility(values)
-        stability_score = max(0, min(max_score * 0.2, (volatility - 0.3) * max_score))
+        stability_score = max(0, min(max_score * 0.5, volatility * max_score))
         
         # 综合得分
-        total = trend_score + recent_score + stability_score
+        total = trend_score + stability_score
         
         return {
             "score": round(total, 2),
@@ -578,13 +559,6 @@ class BurnoutAnalyzer:
                 "slope": round(slope, 4),
                 "slope_percent_per_month": round(slope * 100, 2),
                 "score": round(trend_score, 2),
-            },
-            "recent_state": {
-                "early_avg": round(early_avg, 2),
-                "recent_avg": round(recent_avg, 2),
-                "change": round(recent_change, 4),
-                "change_percent": round(recent_change * 100, 2),
-                "score": round(recent_score, 2),
             },
             "stability": {
                 "volatility": round(volatility, 4),
@@ -599,12 +573,11 @@ class BurnoutAnalyzer:
         metrics_series: List[MonthlyMetrics],
     ) -> Dict[str, Any]:
         """
-        计算综合倦怠风险评分（三层分析架构）
+        计算综合倦怠风险评分（两层分析架构）
         
         每个维度都使用：
-        - 长期趋势 (40%): 线性回归
-        - 近期状态 (40%): 最近3月 vs 最早3月
-        - 稳定性 (20%): 波动率惩罚
+        - 长期趋势 (50%): 对归一化序列做线性回归，斜率反映整个观测期的走向
+        - 稳定性惩罚 (50%): 月度环比变化率的标准差，波动越大扣分越多
         
         四个维度：
         - 活跃度 (0-25分)
@@ -714,7 +687,7 @@ class BurnoutAnalyzer:
             "factors": factors,
             "months_analyzed": n,
             "period": f"{earliest.month} to {latest.month}",
-            "analysis_method": "three_layer",  # 标记使用新算法
+            "analysis_method": "two_layer",  # 长期趋势50% + 稳定性惩罚50%
         }
     
     def analyze_all_repos(self) -> Dict[str, Any]:
@@ -748,6 +721,9 @@ class BurnoutAnalyzer:
             
             logger.info(f"[{repo_idx}/{total_repos}] 分析: {repo_name} ({len(months)} 个月)")
             
+            # 过滤掉 2026-03（数据不完整）
+            months = {m: p for m, p in months.items() if m != "2026-03"}
+
             # 加载所有月份的图并计算指标
             metrics_series = []
             for month, graph_path in sorted(months.items()):

@@ -24,44 +24,76 @@
 ### 1. 环境安装
 
 ```bash
-# 创建并激活虚拟环境
+# Python >= 3.10
 python -m venv venv
 source venv/bin/activate  # Linux/macOS
 # Windows: venv\Scripts\activate
 
-# 安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 一键运行全部分析并生成综合报告
+核心依赖：`networkx`、`pandas`、`numpy`、`matplotlib`、`tqdm`。
 
-**方式一：使用简化脚本（推荐新手）**
+### 2. 准备数据
+
+项目需要 GitHub Archive 事件数据。数据存放在 `data/` 下（已被 `.gitignore` 排除），
+或通过 `--data-dir` 指定外部目录。详见下方"数据采集"章节。
+
+**月度图**（`output/monthly-graphs/`）是所有分析器的共同输入。如果图已构建好，后续分析直接复用。
+
+### 3. 一键运行全部分析并生成报告
+
+**方式一：使用简化脚本（推荐）**
 
 ```bash
-# 完整运行所有分析
-python run_all.py
+# 完整运行：构图 + 全部分析 + 报告
+python run_all.py --workers 8
 
-# 指定并行工作进程数
-python run_all.py --workers 16
-
-# 快速模式：跳过已有的毒性缓存和月度图
-python run_all.py --quick
+# 快速模式：月度图和毒性缓存已存在时跳过
+python run_all.py --quick --workers 8
 ```
 
-**方式二：使用一站式命令行工具（更多选项）**
+**方式二：使用 `run_analysis.py`（更灵活）**
 
 ```bash
-# 运行所有分析器和报告生成
+# 全量运行
 python run_analysis.py --all --workers 8
 
-# 跳过耗时的毒性缓存生成（如已存在）
-python run_analysis.py --all --skip toxicity_cache --workers 8
+# 跳过构图和毒性缓存（推荐：月度图已存在时）
+python run_analysis.py --all --skip monthly_graphs toxicity_cache --workers 8 --continue-on-error
+
+# 只跑四个核心分析 + 人员流动 + 全部报告
+python run_analysis.py \
+  --analyzers burnout newcomer community_atmosphere bus_factor personnel_flow \
+  --reports burnout_report newcomer_report atmosphere_report bus_factor_report comprehensive_report \
+  --continue-on-error --workers 8
 ```
 
-### 3. 查看结果
+**已验证的完整命令**（假设 `output/monthly-graphs/` 已存在）：
+
+```bash
+python run_analysis.py \
+  --analyzers burnout newcomer community_atmosphere bus_factor quality_risk structure personnel_flow \
+  --reports burnout_report newcomer_report bus_factor_report atmosphere_report quality_risk_report structure_report comprehensive_report \
+  --skip monthly_graphs toxicity_cache \
+  --continue-on-error --verbose --workers 8
+```
+
+此命令依次执行：
+1. **倦怠分析** (burnout) — 核心维护者活跃度、响应时间、流失预警
+2. **新人体验分析** (newcomer) — 融入距离、晋升路径、核心可达性
+3. **社区氛围分析** (community_atmosphere) — CHAOSS 指标、聚类系数、网络结构
+4. **Bus Factor 分析** (bus_factor) — 贡献集中度、关键人物风险
+5. **质量风险分析** (quality_risk) — 可疑贡献者识别
+6. **网络结构分析** (structure) — 图直径、平均距离、连通分量
+7. **人员流动分析** (personnel_flow) — 留存率、跨项目流向
+8. 生成各维度报告 + **综合健康度报告**
+
+### 4. 查看结果
 
 - 综合报告：`output/comprehensive_report.md`
 - 各维度详细报告：`output/<分析类型>/detailed_report.txt`
+- 完整 JSON 数据：`output/<分析类型>/full_analysis.json`
 
 ---
 

@@ -136,7 +136,9 @@ class PersonnelFlowAnalyzer:
             index = json.load(f)
 
         result = {}
-        for repo_name in repo_names:
+        total_repos = len(repo_names)
+        total_graphs_loaded = 0
+        for repo_idx, repo_name in enumerate(repo_names, 1):
             graph_types = index.get(repo_name, {})
             first_val = next(iter(graph_types.values()), {})
             if isinstance(first_val, dict) and not first_val.get("node_type"):
@@ -144,10 +146,13 @@ class PersonnelFlowAnalyzer:
             else:
                 months_data = graph_types
             if not months_data or not isinstance(months_data, dict):
+                logger.info(f"  [{repo_idx}/{total_repos}] {repo_name}: 无图数据，跳过")
                 continue
+            logger.info(f"  [{repo_idx}/{total_repos}] 加载 {repo_name} 的 {len(months_data)} 个月度图...")
             metrics_series = []
             for month, graph_path in sorted(months_data.items()):
                 graph = self._load_graph(graph_path)
+                total_graphs_loaded += 1
                 if graph is None:
                     continue
                 degrees = dict(graph.degree())
@@ -168,6 +173,7 @@ class PersonnelFlowAnalyzer:
                 })
             if metrics_series:
                 result[repo_name] = {"metrics": metrics_series}
+        logger.info(f"图加载完成: {total_graphs_loaded} 个图, {len(result)} 个有效 repo")
         return result
 
     def _extract_core_per_month(

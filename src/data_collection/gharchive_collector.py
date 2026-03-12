@@ -495,7 +495,16 @@ def main():
     args = parser.parse_args()
     
     # 获取目标项目
-    if args.repos_from_index:
+    if args.repo_list:
+        repo_list_path = Path(args.repo_list)
+        if not repo_list_path.exists():
+            logger.error(f"仓库列表文件不存在: {repo_list_path}")
+            sys.exit(1)
+        with open(repo_list_path, "r", encoding="utf-8") as f:
+            repo_list = json.load(f)
+        target_projects = {r.lower() for r in repo_list}
+        logger.info(f"从仓库列表加载 {len(target_projects)} 个仓库: {repo_list_path}")
+    elif args.repos_from_index:
         index_path = Path(args.repos_from_index)
         if not index_path.exists():
             logger.error(f"索引文件不存在: {index_path}")

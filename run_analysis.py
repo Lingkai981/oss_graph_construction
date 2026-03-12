@@ -664,6 +664,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     ctx = resolve_paths(args)
 
+    # 初始化日志系统，确保分析器内部的 logger.info() 能输出到控制台和日志文件
+    from src.utils.logger import setup_logger
+    setup_logger(log_level="INFO", log_file=str(ctx.output_dir / "analysis.log"))
+
     print("流水线配置：")
     print(f"  根目录:       {ctx.root_dir}")
     print(f"  数据源:       {ctx.data_dir}")
